@@ -11,8 +11,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from orchestrator.auto_events import (Binding, COMMAND, REPOSITORY, ReplyUnconfirmed, event_id,
-                                      github_publisher, main, process)
+from orchestrator.auto_events import (
+    ACTIONS_BOT_ID, ACTIONS_BOT_LOGIN, AUTHOR_ACCOUNT, COMMAND, REPOSITORY, SHARED_MODE,
+    Binding, ReplyUnconfirmed, event_id, github_publisher, main, process,
+)
 from orchestrator.auto_state import REFS, PairedState
 from orchestrator.state import StateConflict
 
@@ -319,3 +321,80 @@ os._exit(28)
             self.assertEqual(publish("synthetic"), 7)
             self.assertEqual([call.args[0].get_method() for call in opener.open.call_args_list],
                              ["GET", "GET", "POST"])
+
+    def shared_fixture(self):
+        binding = Binding(50, 2, AUTHOR_ACCOUNT, ACTIONS_BOT_ID, AUTHOR_ACCOUNT, SHARED_MODE)
+        event = self.event()
+        event["sender"]["id"] = event["comment"]["user"]["id"] = AUTHOR_ACCOUNT
+        return binding, event
+
+    def test_shared_account_accepts_only_synthetic_command_and_keeps_existing_anchors(self):
+        binding, event = self.shared_fixture()
+        sent = []
+        publish = lambda body: sent.append(body) or len(sent)
+        self.assertTrue(process(self.state, event, binding, str(AUTHOR_ACCOUNT), publish))
+        self.assertTrue(process(self.new_state(), event, binding, str(AUTHOR_ACCOUNT), publish))
+        self.assertEqual(len(sent), 2)
+        self.assertTrue(all("Shared-account test with no AI attribution." in body for body in sent))
+        self.assertEqual(self.state.anchors, self.anchors)
+        self.assertEqual(self.state.update(self.inspect), [(101, 1)])
+        with self.assertRaisesRegex(ValueError, "distinct"):
+            Binding(50, 2, AUTHOR_ACCOUNT, ACTIONS_BOT_ID, AUTHOR_ACCOUNT)
+        with self.assertRaisesRegex(StateConflict, "persisted synthetic binding"):
+            process(self.new_state(), self.event(), self.binding, "41", publish)
+        event["sender"]["id"] = event["comment"]["user"]["id"] = ACTIONS_BOT_ID
+        event["comment"]["body"] = sent[0]
+        self.assertFalse(process(None, event, binding, str(ACTIONS_BOT_ID), None))
+        event["comment"]["body"] = COMMAND
+        self.assertFalse(process(None, event, binding, str(ACTIONS_BOT_ID), None))
+
+    def test_actions_reply_authors_and_recovery_use_system_identity(self):
+        binding, _ = self.shared_fixture()
+        target = {"state": "open", "number": 2, "base": {"repo": {"id": 50, "full_name": REPOSITORY}}}
+        bot = {"id": ACTIONS_BOT_ID, "login": ACTIONS_BOT_LOGIN, "type": "Bot"}
+        with patch("orchestrator.auto_events.urllib.request.build_opener") as build:
+            opener = build.return_value
+            values = [target, {"id": 7, "user": bot}, [
+                {"id": 8, "body": "synthetic", "user": {**bot, "login": "someone-else"}},
+                {"id": 7, "body": "synthetic", "user": bot},
+            ]]
+            opener.open.side_effect = [io.BytesIO(json.dumps(value).encode()) for value in values]
+            publish, find = github_publisher(binding, "fixture-token")
+            self.assertEqual(publish("synthetic"), 7)
+            self.assertEqual(find("synthetic"), 7)
+            requests = [call.args[0] for call in opener.open.call_args_list]
+            self.assertEqual([req.get_method() for req in requests], ["GET", "POST", "GET"])
+            self.assertTrue(all("/repos/" in req.full_url for req in requests))
+        with patch("orchestrator.auto_events.urllib.request.build_opener") as build:
+            build.return_value.open.side_effect = [
+                io.BytesIO(json.dumps(target).encode()),
+                io.BytesIO(json.dumps({"id": 8, "user": {**bot, "type": "User"}}).encode()),
+            ]
+            publish, _ = github_publisher(binding, "fixture-token")
+            with self.assertRaisesRegex(RuntimeError, "unexpected reply author"):
+                publish("synthetic")
+
+    def test_shared_entrypoint_uses_only_the_builtin_reply_token(self):
+        binding, event = self.shared_fixture()
+        event_path = self.root / "event.json"
+        event_path.write_text(json.dumps(event))
+        env = {
+            "ORCHESTRATOR_AUTO_SYNTHETIC_ENABLED": "1", "ORCHESTRATOR_AUTO_IDENTITY_MODE": SHARED_MODE,
+            "GITHUB_EVENT_NAME": "issue_comment", "GITHUB_REPOSITORY": REPOSITORY,
+            "GITHUB_REF": "refs/heads/main", "GITHUB_EVENT_PATH": str(event_path),
+            "GITHUB_ACTOR_ID": str(AUTHOR_ACCOUNT), "ORCHESTRATOR_AUTO_REPOSITORY_ID": "50",
+            "ORCHESTRATOR_AUTO_PR": "2", "ORCHESTRATOR_AUTO_ENVIRONMENT": "fixture",
+            "ORCHESTRATOR_AUTO_STATE_ANCHOR": self.anchors[0],
+            "ORCHESTRATOR_AUTO_CHECKPOINT_ANCHOR": self.anchors[1],
+            "ORCHESTRATOR_STATE_TOKEN": "fixture-state", "ORCHESTRATOR_AUTO_REPLY_TOKEN": "wrong-channel",
+        }
+        with patch.dict(os.environ, env, clear=True), patch(
+            "orchestrator.auto_events.github_publisher",
+        ) as publisher, patch("orchestrator.auto_events.PairedState"), patch("orchestrator.auto_events.process"):
+            with self.assertRaisesRegex(RuntimeError, "credentials"):
+                main()
+            publisher.assert_not_called()
+            os.environ["GITHUB_TOKEN"] = "fixture-actions"
+            publisher.return_value = (None, None)
+            main()
+            publisher.assert_called_once_with(binding, "fixture-actions")

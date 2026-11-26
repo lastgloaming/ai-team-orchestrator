@@ -33,6 +33,7 @@ class GitState:
         env.pop("DEEPSEEK_API_KEY", None)
         env.pop("ORCHESTRATOR_PROBE_TOKEN", None)
         env.pop("ORCHESTRATOR_AUTO_REPLY_TOKEN", None)
+        env.pop("GITHUB_TOKEN", None)
         token = env.pop("ORCHESTRATOR_STATE_TOKEN", None)
         if self.remote == LIVE_REMOTE and token and (args[0] in {"ls-remote", "fetch"} or "push" in args):
             auth = base64.b64encode(f"x-access-token:{token}".encode()).decode()
