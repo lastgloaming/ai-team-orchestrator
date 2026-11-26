@@ -67,11 +67,13 @@ python3.12 -m venv /path/to/private/orch-venv
 
 桥接凭证通过环境变量 ORCHESTRATOR_V1_BRIDGE_TOKENS 注入 JSON，四个角色 observer、codex、chatgpt、operator 使用不同的随机 bearer。仅可信宿主管理者可编辑配置和绑定凭证。共享账号评论、GitHub login、正文和未验证的 App ID 不能建立角色绑定。现有 ChatGPT/Codex 自动任务是否能够调用私有桥仍需另批连通验证。终审证据独立读取后写入可信配置；只给出 PR 链接并不构成证明。
 
+候选多 Worker 模式在可信配置中列出 workers，codex 凭证改为 worker ID 到独立 bearer 的映射；其余角色保持各自独立。未配置时保留单 Worker 串行，不把旧租约解释成新身份。任务范围使用 repo、branch:名称 或 file:相对路径；重叠或无法确认范围时不并发。同一 Worker 最多持有一份活动或未确认的租约。POST /v1/renew 仅限原 Worker 和仍有效的租约、授权及依赖。预算预留与领取在同一事务。变更预算窗口需可信窗口证明；本候选的 CLI／桥默认没有经过核验的身份与窗口证明提供方。
+
 ### V1 事件与审批闭环
 
 - POST /v1/event（observer）接收已审核配置中的 task_id。事件的认证与 PR/CI 元数据核验由受信上游完成。接口不从正文生成任务，不让请求覆盖授权、HEAD 或预算。配置应原子替换，由已验证的读路径及时刷新。
 - POST /v1/next（codex）在同一持久台账按优先级、精确版本、有效授权和有效依赖领取。已有巡检可在下一次唤醒访问；生产变更需单独批准。POST /v1/result（codex）提交 task_id、lease、evidence，生成重要审核的终审任务。结算后消费者可请求下一次决策；未成功确认结算时先核对，不能重做工作。
-- POST /v1/final/claim（chatgpt）仅由独立接收方使用。须配置 final_capacity_confirmed=true 证明现有套餐可覆盖。终审核对完整 HEAD、base、授权和已核验测试证据，并返回独立租约。POST /v1/final/result 提交 task_id、lease、head、base、authorization、outcome 和 GitHub 审核链接 evidence。可信上游另在 final_evidence[task_id] 记录匹配的 head、base、authorization、outcome、evidence、reviewer=chatgpt 后才可入账。相同决策去重。PASS 解开仍有效的技术依赖，合并仍为 AUTHOR_REQUIRED。旧 HEAD、改授权、缺独立证据无法解锁。
+- POST /v1/final/claim（chatgpt）仅由独立接收方使用。须配置 final_capacity_confirmed=true 证明现有套餐可覆盖。终审核对完整 HEAD、base、授权和已核验测试证据，并返回独立租约。POST /v1/final/result 提交 task_id、lease、head、base、authorization、outcome 和 GitHub 审核链接 evidence。可信上游另在 final_evidence[task_id] 记录匹配的 head、base、authorization、outcome、evidence、reviewer=chatgpt 后才可入账。相同决策去重。PASS 解开仍有效的技术依赖，合并仍为 AUTHOR_REQUIRED。旧 HEAD、改授权、缺独立证据无法解锁。领取终审及提交任何终审结论都须验证该版本的完整作者集合与审查者独立性；依赖链因版本或授权变化而失效时不得以旧结论释放下游。技术 PASS 不等于作者批准合并。
 - 兼容同逻辑任务别名，依赖指向规范记录。新的可信授权可替换未领取任务、尚未被领取的终审以及有独立无副作用恢复证明的任务。完成的技术审核不因重复配置重跑。过期的普通和终审租约均握持到独立核对。POST /v1/reconcile 或 /v1/final/reconcile（operator）要求专属于该任务仓库的 run URL，以及 recovery 或 final_recovery 中精确对应 lease、run 且 no_active_or_external_effect=true 的可信证明。不能用另一仓库链接解锁，确认不明时不回放。
 - 普通任务的 units=0 也至少预留一单位。预算 window、remaining、reserve 是已验证套餐的可信快照，不能从事件传入。单独的 ChatGPT 容量证明确认不了就不领终审。保留既有停用开关。DeepSeek Advisor 和 P5 私有调度接口保留，中央决策当前使用确定性规则，全部真实费用与部署硬阻断仍有效。
 
@@ -87,6 +89,6 @@ POST /v1/handoffs 仅导出外部角色的 BLOCKED 请求。POST /v1/handoffs/ob
 
 作者已提供脱敏 rc1 契约，接收端据报仅确认了 slug 检查，数字 App ID 检查和全量补丁尚待独立验收。POST /v1/control/stage（operator）为当前已授权任务写入 PENDING_SEND，分配独占 CMD-ORCH- 大写 ULID，绑定任务、授权版本、Control 仓库数字 ID、PR #3 和正文 SHA-256。相同任务再次请求仍返回相同编号；桥只返回候选元数据及 BLOCKED。旧编号解析另行保留。配置 control_rc1_repository_id 必须来自已核验 GitHub 元数据。
 
-POST /v1/control/observe（operator）接收 task_id、repository_id、pr、authorization、actor_id、app_id、app_slug、comment、kind（publication 或 receipt）和 body。只有可信 GitHub 读取器核验该信封后，才可将 Python json.dumps(packet, sort_keys=True) 字节的 SHA-256 写入私有 verified_rc1_observations[comment]。桥核对完整摘要、共享账号数字 ID 和相应发送／接收 App 的 ID 与 slug。来源只能证明传输，不能批准任务。唯一精确正文匹配关联真实 publication ID。没有观察保持原状态，多评论匹配转 AMBIGUOUS，且没有自动发送或重发方法。
+POST /v1/control/observe（operator）接收 task_id、repository_id、pr、authorization、actor_id、app_id、app_slug、comment、kind（publication 或 receipt）、created_at、updated_at（可信来源正整数 Unix 秒）和 body。缺少时间证明、首次发现已经编辑的评论或相互矛盾的完整回执时不结算。只有可信 GitHub 读取器核验该信封后，才可将 Python json.dumps(packet, sort_keys=True) 字节的 SHA-256 写入私有 verified_rc1_observations[comment]。桥核对完整摘要、共享账号数字 ID 和相应发送／接收 App 的 ID 与 slug。来源只能证明传输，不能批准任务。唯一精确正文匹配关联真实 publication ID。没有观察保持原状态，多评论匹配转 AMBIGUOUS，且没有自动发送或重发方法。
 
-rc1 ACK/RESULT 固定绑定 command_id（兼容 id）、receipt_id、in_reply_to 和 part（缺省 1/1），分段以任务和 receipt_id 分组。同一分段只保存摘要及真实评论 ID，分段冲突为 AMBIGUOUS，收全才处理终态。I/S/C 只作不透明证据标签，正文不入库。候选示例用 RESULT:<command_id>:1，分隔符需与接收侧再核实。收全仅记候选回执状态，不解锁 v1 执行和终审。真实发送与自动信任收件继续被禁止。
+rc1 ACK/RESULT 固定绑定 command_id（兼容 id）、receipt_id、in_reply_to 和 part（缺省 1/1），分段以任务和 receipt_id 分组。同一分段只保存摘要及真实评论 ID，分段冲突为 AMBIGUOUS，收全才处理终态。I/S/C 只作不透明证据标签，正文不入库。新候选使用精确的 RESULT-<command_id>-1 / ACK-<command_id>-1 形式，并兼容不缩进的 `- [I]`、`- [S]` 或 `- [C]` 证据续行。旧协议的解析路径不变。可信读取器仅在确认完整清单后提交对账；一个匹配分页不能结算不确定发送，零匹配不能触发补发。收全仅记候选回执状态，不解锁 v1 执行和终审。真实发送与自动信任收件继续被禁止。

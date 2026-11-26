@@ -34,7 +34,7 @@ class BridgeTests(unittest.TestCase):
             policy = root / "policy.json"
             policy.write_text(json.dumps(config))
             server = ThreadingHTTPServer(("127.0.0.1", 0), handler(
-                Queue(root / "queue.sqlite", now=lambda: 100), policy, tokens,
+                Queue(root / "queue.sqlite", now=lambda: 100, verified_authors=lambda task: {"fixture-author"}), policy, tokens,
             ))
             thread = threading.Thread(target=server.serve_forever)
             thread.start()

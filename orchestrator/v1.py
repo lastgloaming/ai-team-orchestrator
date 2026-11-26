@@ -26,6 +26,9 @@ CREATE TABLE IF NOT EXISTS v1_task (
  id TEXT PRIMARY KEY, logical_key TEXT NOT NULL UNIQUE, spec TEXT NOT NULL,
  state TEXT NOT NULL, lease TEXT, deadline INTEGER, evidence TEXT
 );
+CREATE TABLE IF NOT EXISTS v1_owner (
+ task_id TEXT PRIMARY KEY REFERENCES v1_task(id), worker TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS v1_alias (
  alias TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES v1_task(id)
 );
@@ -57,6 +60,54 @@ def sha(value):
     return isinstance(value, str) and bool(SHA.fullmatch(value))
 
 
+def scope_key(value):
+    """Only explicit repository, branch, and relative literal file scopes participate."""
+    if value == "repo":
+        return ("repo", "")
+    if not isinstance(value, str):
+        return None
+    kind, sep, path = value.partition(":")
+    if not sep or kind not in {"file", "branch"} or path.startswith("/") or not path:
+        return None
+    parts = path.split("/")
+    if kind == "file":
+        parts = [part for part in parts if part not in ("", ".")]
+    if not parts or any(not re.fullmatch(r"[A-Za-z0-9_.-]+", part) or part in {".", ".."}
+                        or part.lower() == ".git" for part in parts):
+        return None
+    if kind == "branch" and (".." in path or any(part.startswith(".") or part.endswith(".lock")
+                                                 for part in parts) or path.endswith(".")):
+        return None
+    return kind, "/".join(parts).lower()
+
+
+def overlaps(left, right):
+    first, second = scope_key(left.scope), scope_key(right.scope)
+    if not first or not second:
+        return True
+    if left.repository.lower() != right.repository.lower():
+        return False
+    if left.pr and left.pr == right.pr:
+        return True
+    kind, a = first
+    other, b = second
+    if kind != other or kind == "repo":
+        return True
+    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
+
+
+def worker_allowed(config, worker):
+    if "workers" not in config:
+        return worker is None
+    workers = config["workers"]
+    return (isinstance(workers, list) and all(worker_name(w) for w in workers)
+            and len(workers) == len(set(workers)) and worker in workers)
+
+
+def worker_name(value):
+    return identifier(value) and value == value.lower() and value not in {"codex", "chatgpt", "operator", "observer", "author"}
+
+
 @dataclass(frozen=True)
 class Task:
     id: str
@@ -74,8 +125,10 @@ class Task:
     dependencies: tuple = ()
 
     def __post_init__(self):
-        if (not all(identifier(x) for x in (self.id, self.authorization, self.scope, *self.dependencies))
+        if (not all(identifier(x) for x in (self.id, self.authorization, *self.dependencies))
+                or not (identifier(self.scope) or scope_key(self.scope))
                 or self.id in self.dependencies or not REPO.fullmatch(self.repository)
+                or any(part in {".", ".."} for part in self.repository.split("/"))
                 or type(self.important) is not bool
                 or (self.authored_here is not None and type(self.authored_here) is not bool)
                 or type(self.priority) is not int or not 0 <= self.priority <= 100
@@ -92,9 +145,12 @@ class Task:
 
 
 class Queue:
-    def __init__(self, path, *, now=time.time):
+    def __init__(self, path, *, now=time.time, verified_authors=None, verified_budget_window=None):
         self.path = path
         self.now = now
+        # Trusted adapter returns the complete principal set for this exact Task.
+        self.verified_authors = verified_authors
+        self.verified_budget_window = verified_budget_window
 
     def _db(self):
         return transaction(self.path, schema=SCHEMA + control_rc1.SCHEMA)
@@ -178,30 +234,77 @@ class Queue:
         )
 
     def _dependencies_ready(self, db, task, states, config):
-        for dependency in task.dependencies:
+        active = {task.id}
+        verified = set()
+        stack = [(task, iter(task.dependencies))]
+        while stack:
+            child, dependencies = stack[-1]
+            dependency = next(dependencies, None)
+            if dependency is None:
+                active.remove(child.id)
+                verified.add(child.id)
+                stack.pop()
+                continue
             if states.get(dependency) != "DONE":
                 return False
-            row = db.execute("""SELECT spec FROM v1_task WHERE id=COALESCE(
+            row = db.execute("""SELECT spec,evidence FROM v1_task WHERE id=COALESCE(
                 (SELECT task_id FROM v1_alias WHERE alias=?), ?)""", (dependency, dependency)).fetchone()
+            if not row or not row[1]:
+                return False
             parent = self._task(row[0])
+            if parent.id in active or (child.kind == "merge" and parent.kind == "review"):
+                return False
+            if parent.id in verified:
+                continue
             if not self._authorized(db, parent, config) or not self._current(parent, config.get("observations", {})):
                 return False
+            evidence = json.loads(row[1])
+            if evidence.get("conclusion") != "PASS":
+                return False
+            if parent.kind == "review":
+                observed = config["observations"][f"{parent.repository}#{parent.pr}"]
+                if any(not evidence.get(k) or evidence[k] != observed.get(k) for k in ("run", "tested_sha")):
+                    return False
+                final = db.execute("SELECT reviewer FROM v1_final_claim WHERE task_id=? AND decision IS NOT NULL",
+                                   (parent.id,)).fetchone()
+                owner = db.execute("SELECT worker FROM v1_owner WHERE task_id=?", (parent.id,)).fetchone()
+                principal = final or owner
+                if not principal or not self.independent(parent, principal[0]):
+                    return False
+            active.add(parent.id)
+            stack.append((parent, iter(parent.dependencies)))
         return True
 
-    def claim(self, config):
+    def independent(self, task, reviewer):
+        authors = self.verified_authors(task) if self.verified_authors else None
+        if (not isinstance(authors, (set, frozenset)) or not authors
+                or not all(identifier(a) and a == a.lower() for a in authors)):
+            return None
+        return reviewer not in authors
+
+    def claim(self, config, *, worker=None):
         with self._db() as db:
             now = int(self.now())
             self._expire(db, now)
             if config.get("stop") is not False or os.environ.get("ORCHESTRATOR_V1_STOP") == "1":
                 return {"status": "BLOCKED", "reason": "stopped"}
-            if db.execute("SELECT 1 FROM v1_task WHERE state IN ('CLAIMED','UNCONFIRMED') LIMIT 1").fetchone():
+            if not worker_allowed(config, worker):
+                return {"status": "BLOCKED", "reason": "worker_identity"}
+            active = db.execute("""SELECT spec,worker FROM v1_task LEFT JOIN v1_owner ON id=task_id
+                                   WHERE state IN ('CLAIMED','UNCONFIRMED')""").fetchall()
+            if active and (worker is None or any(owner in (None, "codex", worker) for _, owner in active)):
                 return {"status": "NOOP", "reason": "in_flight_or_unconfirmed"}
             states = self._states(db)
             ready = [self._task(spec) for (spec,) in db.execute("SELECT spec FROM v1_task WHERE state='READY'")]
             ready.sort(key=lambda task: (-task.priority, task.kind != "review", task.id))
             blockers = set()
             for task in ready:
-                if not self._authorized(db, task, config):
+                independence = self.independent(task, worker or "codex") if task.kind == "review" else True
+                if worker and (not scope_key(task.scope) or any(overlaps(task, self._task(spec)) for spec, _ in active)):
+                    blockers.add("scope")
+                elif independence is False or (worker and independence is None):
+                    blockers.add("review_independence")
+                elif not self._authorized(db, task, config):
                     blockers.add("authorization")
                 elif not self._dependencies_ready(db, task, states, config):
                     blockers.add("dependencies")
@@ -215,20 +318,24 @@ class Queue:
                     lease = secrets.token_hex(16)
                     db.execute("UPDATE v1_task SET state='CLAIMED',lease=?,deadline=? WHERE id=?",
                                (lease, now + 900, task.id))
+                    db.execute("INSERT OR REPLACE INTO v1_owner VALUES (?,?)", (task.id, worker or "codex"))
                     return {"status": "CLAIMED", "task": asdict(task), "role": "codex", "lease": lease}
             return {"status": "NOOP", "blocked": sorted(blockers)}
 
-    @staticmethod
-    def _reserve(db, task, config):
+    def _reserve(self, db, task, config):
         budget = config.get("budget", {})
         remaining, reserve, window = (budget.get(k) for k in ("remaining", "reserve", "window"))
         if (type(remaining) is not int or type(reserve) is not int or reserve < 0
                 or not identifier(window)):
             return False
-        used = db.execute("SELECT COALESCE(SUM(units),0) FROM v1_budget WHERE window=?", (window,)).fetchone()[0]
-        previous = db.execute("SELECT window FROM v1_budget WHERE task_id=?", (task.id,)).fetchone()
-        if previous and previous[0] != window:
+        if self.verified_budget_window:
+            if self.verified_budget_window() != window:
+                return False
+        elif db.execute("SELECT 1 FROM v1_budget WHERE window<>? LIMIT 1", (window,)).fetchone():
             return False
+        if db.execute("SELECT 1 FROM v1_budget WHERE task_id=? AND window<>?", (task.id, window)).fetchone():
+            return False
+        used = db.execute("SELECT COALESCE(SUM(units),0) FROM v1_budget WHERE window=?", (window,)).fetchone()[0]
         units = max(task.units, 1)
         if remaining - used - units <= reserve:
             return False
@@ -236,7 +343,28 @@ class Queue:
                    (task.id, window, units))
         return True
 
-    def complete(self, task_id, lease, config, evidence):
+    def _owned(self, db, task_id, lease, config, worker):
+        row = db.execute("""SELECT spec,state,lease,deadline,worker FROM v1_task
+                            LEFT JOIN v1_owner ON id=task_id WHERE id=?""", (task_id,)).fetchone()
+        if (not worker_allowed(config, worker) or not row or row[1:3] != ("CLAIMED", lease)
+                or row[3] <= int(self.now()) or (row[4] or "codex") != (worker or "codex")):
+            raise ValueError("active claim required for this worker")
+        return self._task(row[0])
+
+    def renew(self, task_id, lease, config, *, worker=None):
+        with self._db() as db:
+            task = self._owned(db, task_id, lease, config, worker)
+            if (config.get("stop") is not False or os.environ.get("ORCHESTRATOR_V1_STOP") == "1"
+                    or not self._authorized(db, task, config)
+                    or not self._current(task, config.get("observations", {}))
+                    or not self._dependencies_ready(db, task, self._states(db), config)
+                    or (worker and task.kind == "review" and not self.independent(task, worker))):
+                return {"status": "BLOCKED"}
+            deadline = int(self.now()) + 900
+            db.execute("UPDATE v1_task SET deadline=? WHERE id=?", (deadline, task_id))
+            return {"status": "RENEWED", "deadline": deadline}
+
+    def complete(self, task_id, lease, config, evidence, *, worker=None):
         required = {"conclusion", "run", "passed", "failed", "risk", "decision", "tested_sha"}
         if (evidence.keys() != required or evidence["conclusion"] not in {"PASS", "REQUEST_CHANGES", "BLOCKED"}
                 or not RUN.fullmatch(evidence["run"]) or not sha(evidence["tested_sha"])
@@ -246,23 +374,23 @@ class Queue:
             raise ValueError("structured execution evidence required")
         with self._db() as db:
             self._expire(db, int(self.now()))
-            row = db.execute("SELECT spec,state,lease FROM v1_task WHERE id=?", (task_id,)).fetchone()
-            if row is None or row[1:] != ("CLAIMED", lease):
-                raise ValueError("active claim required")
-            task = self._task(row[0])
+            task = self._owned(db, task_id, lease, config, worker)
+            independence = self.independent(task, worker or "codex") if task.kind == "review" else True
             state = evidence["conclusion"]
             if (not self._authorized(db, task, config)
-                    or not self._current(task, config.get("observations", {}))):
+                    or not self._current(task, config.get("observations", {}))
+                    or not self._dependencies_ready(db, task, self._states(db), config)):
                 state = "STALE"
             elif task.kind == "review":
                 observed = config["observations"][f"{task.repository}#{task.pr}"]
                 run_root = f"https://github.com/{task.repository}/actions/runs/"
-                if not evidence["run"].startswith(run_root) or (
+                if independence is False or (worker and independence is None) or not evidence["run"].startswith(run_root) or (
                     evidence["tested_sha"] != observed.get("tested_sha") or evidence["run"] != observed.get("run")
                 ):
                     state = "BLOCKED"
             if state == "PASS":
-                state = "WAITING_FINAL" if task.kind == "review" and (task.important or task.authored_here is not False) else "DONE"
+                needs_final = task.kind == "review" and (task.important or task.authored_here is True or not independence)
+                state = "WAITING_FINAL" if needs_final else "DONE"
             db.execute("UPDATE v1_task SET state=?,lease=NULL,deadline=NULL,evidence=? WHERE id=?",
                        (state, json.dumps(evidence), task.id))
             if state == "WAITING_FINAL":
@@ -292,7 +420,8 @@ class Queue:
     def _final_current(self, db, request, config):
         task = Task(**request["task"])
         if (not self._authorized(db, task, config)
-                or not self._current(task, config.get("observations", {}))):
+                or not self._current(task, config.get("observations", {}))
+                or not self._dependencies_ready(db, task, self._states(db), config)):
             return False
         observed = config["observations"][f"{task.repository}#{task.pr}"]
         evidence = request["evidence"]
@@ -305,6 +434,8 @@ class Queue:
                 or config.get("final_capacity_confirmed") is not True):
             return {"status": "BLOCKED"}
         with self._db() as db:
+            if db.execute("SELECT 1 FROM v1_final_claim WHERE reviewer=? AND decision IS NULL", (reviewer,)).fetchone():
+                return {"status": "NOOP"}
             candidates = db.execute("""
                 SELECT t.id,f.request FROM v1_task t JOIN v1_final f ON t.id=f.task_id
                 LEFT JOIN v1_final_claim c ON c.task_id=t.id
@@ -312,7 +443,8 @@ class Queue:
             """)
             for task_id, encoded in candidates:
                 request = json.loads(encoded)
-                if self._final_current(db, request, config):
+                if (self._final_current(db, request, config)
+                        and self.independent(Task(**request["task"]), reviewer) is True):
                     lease = secrets.token_hex(16)
                     db.execute("INSERT INTO v1_final_claim VALUES (?,?,?,?,NULL)",
                                (task_id, reviewer, lease, int(self.now()) + 900))
@@ -338,6 +470,8 @@ class Queue:
             request = json.loads(row[0])
             if not self._final_current(db, request, config):
                 return {"status": "STALE"}
+            if not self.independent(Task(**request["task"]), reviewer):
+                return {"status": "BLOCKED", "reason": "unknown_or_self_review"}
             if row[4] is not None:
                 if row[4] != encoded:
                     raise ValueError("final decision already recorded")

@@ -8,10 +8,10 @@ import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .v1 import Queue, Task
+from .v1 import Queue, Task, worker_name
 
 ROUTES = {
-    "/v1/event": "observer", "/v1/next": "codex", "/v1/result": "codex",
+    "/v1/event": "observer", "/v1/next": "codex", "/v1/result": "codex", "/v1/renew": "codex",
     "/v1/final/claim": "chatgpt", "/v1/final/result": "chatgpt",
     "/v1/reconcile": "operator", "/v1/final/reconcile": "operator",
     "/v1/control/stage": "operator", "/v1/control/observe": "operator",
@@ -19,7 +19,7 @@ ROUTES = {
 }
 
 
-def operate(queue, config, route, payload):
+def operate(queue, config, route, payload, *, worker=None):
     if route == "/v1/event":
         # Body supplies only a pointer. The trusted config defines all task data.
         tasks = [Task(**item) for item in config["tasks"] if item["id"] == payload["task_id"]]
@@ -28,9 +28,11 @@ def operate(queue, config, route, payload):
         queue.add(tasks, config)
         return {"status": "INGESTED", "decision": queue.status()}
     if route == "/v1/next":
-        return queue.claim(config)
+        return queue.claim(config, worker=worker)
     if route == "/v1/result":
-        return queue.complete(payload["task_id"], payload["lease"], config, payload["evidence"])
+        return queue.complete(payload["task_id"], payload["lease"], config, payload["evidence"], worker=worker)
+    if route == "/v1/renew":
+        return queue.renew(payload["task_id"], payload["lease"], config, worker=worker)
     if route == "/v1/final/claim":
         return queue.final_claim(config, "chatgpt")
     if route == "/v1/final/result":
@@ -49,9 +51,15 @@ def operate(queue, config, route, payload):
 
 
 def handler(queue, config_path, secrets):
-    if set(secrets) != set(ROUTES.values()) or len(set(secrets.values())) != len(secrets) or any(
-        not isinstance(value, str) or not value.isascii() or len(value) < 32 for value in secrets.values()
-    ):
+    if set(secrets) != set(ROUTES.values()):
+        raise ValueError("distinct private bridge credentials required")
+    credential = secrets["codex"]
+    workers = credential if isinstance(credential, dict) else {None: credential}
+    if isinstance(credential, dict) and (not workers or not all(worker_name(w) for w in workers)):
+        raise ValueError("invalid worker principal")
+    tokens = [value for role, value in secrets.items() if role != "codex"] + list(workers.values())
+    if (any(not isinstance(value, str) or not value.isascii() or len(value) < 32 for value in tokens)
+            or len(set(tokens)) != len(tokens)):
         raise ValueError("distinct private bridge credentials required")
 
     class Handler(BaseHTTPRequestHandler):
@@ -69,7 +77,10 @@ def handler(queue, config_path, secrets):
         def do_POST(self):
             role = ROUTES.get(self.path)
             supplied = self.headers.get("Authorization", "").encode()
-            if not role or not hmac.compare_digest(supplied, f"Bearer {secrets[role]}".encode()):
+            candidates = workers if role == "codex" else {None: secrets.get(role)}
+            matches = [name for name, token in candidates.items()
+                       if token and hmac.compare_digest(supplied, f"Bearer {token}".encode())]
+            if len(matches) != 1:
                 self.reply(403, {"status": "BLOCKED"})
                 return
             self.connection.settimeout(10)
@@ -80,7 +91,7 @@ def handler(queue, config_path, secrets):
                 payload = json.loads(self.rfile.read(length))
                 if not isinstance(payload, dict):
                     raise ValueError("invalid payload")
-                result = operate(queue, json.loads(config_path.read_bytes()), self.path, payload)
+                result = operate(queue, json.loads(config_path.read_bytes()), self.path, payload, worker=matches[0])
             except (ValueError, TypeError, KeyError, OSError, sqlite3.Error):
                 self.reply(400, {"status": "BLOCKED"})
                 return

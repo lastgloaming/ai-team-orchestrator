@@ -30,7 +30,7 @@ class QueueTests(unittest.TestCase):
                          "risk": "fixture", "decision": "author_merge", "tested_sha": HEAD}
 
     def open(self):
-        return Queue(self.path, now=lambda: self.now)
+        return Queue(self.path, now=lambda: self.now, verified_authors=lambda task: {"fixture-author"})
 
     def test_exact_review_dedupe_priorities_and_independent_handoff(self):
         self.queue.add([self.dev, self.review, replace(self.review, id="duplicate", authorization="other")])
@@ -177,7 +177,7 @@ class QueueTests(unittest.TestCase):
 
         publication = {
             "task_id": "m1", "repository_id": 21, "pr": 3, "authorization": "auth",
-            "actor_id": 338499555, "comment": 30, "kind": "publication",
+            "actor_id": 338499555, "comment": 30, "kind": "publication", "created_at": 100, "updated_at": 100,
             "app_id": 1144995, "app_slug": "chatgpt-codex-connector",
             "body": (f"AI-INTEGRATION-COMMAND\nid: {command}\nfrom: ChatGPT\ntarget: memory\n"
                      "scope: coordination\ntask: Report synthetic status for the authorized task."),
@@ -185,14 +185,14 @@ class QueueTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unverified publication"):
             observe({**publication, "app_id": 1})
         self.assertEqual(observe(publication)["status"], "SENT")
-        result = f"AI-INTEGRATION-RESULT\nid: {command}\nreceipt_id: RESULT:{command}:1\nin_reply_to: 30\nstatus: DONE"
-        packet = {**publication, "kind": "receipt", "app_id": 1210556, "app_slug": "cursor", "comment": 32,
+        result = f"AI-INTEGRATION-RESULT\nid: {command}\nreceipt_id: RESULT-{command}-1\nin_reply_to: 30\nstatus: DONE"
+        packet = {**publication, "kind": "receipt", "app_id": 1210556, "app_slug": "cursor", "comment": 32, "created_at": 102, "updated_at": 102,
                   "body": result + "\npart: 2/2\nevidence: fixture\n[I] second"}
         with self.assertRaisesRegex(ValueError, "unverified receipt source"):
             observe({**packet, "app_slug": "wrong"})
         self.assertEqual(observe(packet)["status"], "INCOMPLETE")
         self.assertEqual(observe(packet)["status"], "DUPLICATE_PART")
-        self.assertEqual(observe({**packet, "comment": 31,
+        self.assertEqual(observe({**packet, "comment": 31, "created_at": 101, "updated_at": 101,
                                   "body": result + "\npart: 1/2\nevidence: fixture\n[S] first"})["receipt_status"], "DONE")
         self.assertEqual(self.open().status()["m1"], "READY")
-        self.assertEqual(observe({**packet, "comment": 33, "body": packet["body"] + " edited"})["status"], "AMBIGUOUS")
+        self.assertEqual(observe({**packet, "comment": 33, "created_at": 103, "updated_at": 103, "body": packet["body"] + " edited"})["status"], "AMBIGUOUS")
