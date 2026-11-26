@@ -11,6 +11,7 @@ import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
+from . import control_rc1
 from .core import IDENTIFIER, transaction
 
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -96,7 +97,7 @@ class Queue:
         self.now = now
 
     def _db(self):
-        return transaction(self.path, schema=SCHEMA)
+        return transaction(self.path, schema=SCHEMA + control_rc1.SCHEMA)
 
     @staticmethod
     def _task(spec):
@@ -436,6 +437,35 @@ class Queue:
                 db.execute("INSERT INTO v1_connector_receipt VALUES (?,?,?,?)",
                            (task.id, record, packet["publication"], packet["receipt"]))
             return {"status": "BLOCKED", "association": "RECORDED", "execution": "UNVERIFIED"}
+
+    def stage_rc1(self, config, task_id):
+        repository_id = config.get("control_rc1_repository_id")
+        if type(repository_id) is not int or not 0 < repository_id < 2**63:
+            return {"status": "BLOCKED", "reason": "unverified_control_repository"}
+        with self._db() as db:
+            row = db.execute("SELECT spec,state FROM v1_task WHERE id=?", (task_id,)).fetchone()
+            task = self._task(row[0]) if row else None
+            if (not task or row[1] != "READY" or ROLES.get(task.kind) != "integration"
+                    or config.get("stop") is not False or os.environ.get("ORCHESTRATOR_V1_STOP") == "1"
+                    or not self._authorized(db, task, config)
+                    or not self._current(task, config.get("observations", {}))
+                    or not self._dependencies_ready(db, task, self._states(db), config)):
+                return {"status": "BLOCKED", "reason": "prerequisites"}
+            return control_rc1.stage(db, task, repository_id, self.now())
+
+    def observe_rc1(self, config, packet):
+        # No caller-supplied provenance without the trusted observer's exact proof.
+        commitment = hashlib.sha256(json.dumps(packet, sort_keys=True).encode()).hexdigest()
+        if config.get("verified_rc1_observations", {}).get(str(packet["comment"])) != commitment:
+            raise ValueError("verified GitHub metadata required")
+        with self._db() as db:
+            row = db.execute("SELECT spec FROM v1_task WHERE id=?", (packet["task_id"],)).fetchone()
+            task = self._task(row[0]) if row else None
+            if not task or not self._authorized(db, task, config) or not self._current(
+                task, config.get("observations", {})
+            ):
+                raise ValueError("stale Control observation")
+            return control_rc1.observe(db, packet)
 
     def status(self):
         with self._db() as db:

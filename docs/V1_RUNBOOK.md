@@ -82,3 +82,11 @@ POST /v1/handoffs 仅导出外部角色的 BLOCKED 请求。POST /v1/handoffs/ob
 真实分发仍需接收端已审核补丁的确切版本，以及独占编号、发送 App 元数据、评论绑定、分段回执和持久对账合同。只读核查到的 Control PR #3 Git HEAD 仍为 2f0b00de20dac36a6b4f3d1e3eca47c63346ee60，未独立取得补丁并不能验证真实兼容。本 PR 继续沿用当前 v1.0 解析的保守边界，零匹配或多匹配时禁止补发。没有经过核验的 ChatGPT 发布能力，不利用 GITHUB_TOKEN 假装 ChatGPT App。Writer 现有 GitHub 更新路径不改，Memory 经 Integration，Editor 未接入。不得向公网台账写入真实任务、账单、凭证或正文。
 
 **验证**：本地 HTTP 集成用例覆盖事件→可信策略决定→Codex 领取→结果→独立 ChatGPT 领取与回传→下一项可领取任务。它没有验证公网托管或真实连接器身份。已安装包的 CLI 验证为 bash scripts/check_v1_install.sh；已有 setuptools>=68 时该脚本在临时目录离线构建，在仓库之外运行已安装入口。
+
+### Control v1.0-rc1 候选路径
+
+作者已提供脱敏 rc1 契约，接收端据报仅确认了 slug 检查，数字 App ID 检查和全量补丁尚待独立验收。POST /v1/control/stage（operator）为当前已授权任务写入 PENDING_SEND，分配独占 CMD-ORCH- 大写 ULID，绑定任务、授权版本、Control 仓库数字 ID、PR #3 和正文 SHA-256。相同任务再次请求仍返回相同编号；桥只返回候选元数据及 BLOCKED。旧编号解析另行保留。配置 control_rc1_repository_id 必须来自已核验 GitHub 元数据。
+
+POST /v1/control/observe（operator）接收 task_id、repository_id、pr、authorization、actor_id、app_id、app_slug、comment、kind（publication 或 receipt）和 body。只有可信 GitHub 读取器核验该信封后，才可将 Python json.dumps(packet, sort_keys=True) 字节的 SHA-256 写入私有 verified_rc1_observations[comment]。桥核对完整摘要、共享账号数字 ID 和相应发送／接收 App 的 ID 与 slug。来源只能证明传输，不能批准任务。唯一精确正文匹配关联真实 publication ID。没有观察保持原状态，多评论匹配转 AMBIGUOUS，且没有自动发送或重发方法。
+
+rc1 ACK/RESULT 固定绑定 command_id（兼容 id）、receipt_id、in_reply_to 和 part（缺省 1/1），分段以任务和 receipt_id 分组。同一分段只保存摘要及真实评论 ID，分段冲突为 AMBIGUOUS，收全才处理终态。I/S/C 只作不透明证据标签，正文不入库。候选示例用 RESULT:<command_id>:1，分隔符需与接收侧再核实。收全仅记候选回执状态，不解锁 v1 执行和终审。真实发送与自动信任收件继续被禁止。

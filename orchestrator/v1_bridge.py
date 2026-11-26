@@ -14,6 +14,7 @@ ROUTES = {
     "/v1/event": "observer", "/v1/next": "codex", "/v1/result": "codex",
     "/v1/final/claim": "chatgpt", "/v1/final/result": "chatgpt",
     "/v1/reconcile": "operator", "/v1/final/reconcile": "operator",
+    "/v1/control/stage": "operator", "/v1/control/observe": "operator",
     "/v1/handoffs": "operator", "/v1/handoffs/observe": "operator",
 }
 
@@ -38,6 +39,10 @@ def operate(queue, config, route, payload):
         return queue.reconcile(payload["task_id"], payload["run"], config)
     if route == "/v1/final/reconcile":
         return queue.final_reconcile(config, payload["task_id"], payload["run"])
+    if route == "/v1/control/stage":
+        return queue.stage_rc1(config, payload["task_id"])
+    if route == "/v1/control/observe":
+        return queue.observe_rc1(config, payload)
     if route == "/v1/handoffs/observe":
         return queue.associate_handoff(config, payload)
     return {"handoffs": queue.external_handoffs(config)}

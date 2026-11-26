@@ -154,3 +154,45 @@ class QueueTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "conflicting"):
             self.open().associate_handoff(self.config, alternate)
         self.assertEqual(self.open().status()["m1"], "READY")
+
+    def test_rc1_stable_ulid_identity_and_multipart_completion(self):
+        import hashlib
+        import json
+
+        memory = Task("m1", "example/alpha", "memory", "auth", 30, 1)
+        self.queue.add([memory])
+        self.config.update(control_rc1_repository_id=21, verified_rc1_observations={})
+        self.config["authorizations"]["m1"] = "auth"
+        staged = self.queue.stage_rc1(self.config, "m1")
+        self.assertEqual(staged["delivery"], "PENDING_SEND")
+        command = staged["command_id"]
+        self.assertRegex(command, r"^CMD-ORCH-[0-9A-HJKMNP-TV-Z]{26}$")
+        self.assertEqual(self.open().stage_rc1(self.config, "m1"), staged)
+
+        def observe(packet):
+            self.config["verified_rc1_observations"][str(packet["comment"])] = hashlib.sha256(
+                json.dumps(packet, sort_keys=True).encode()
+            ).hexdigest()
+            return self.open().observe_rc1(self.config, packet)
+
+        publication = {
+            "task_id": "m1", "repository_id": 21, "pr": 3, "authorization": "auth",
+            "actor_id": 338499555, "comment": 30, "kind": "publication",
+            "app_id": 1144995, "app_slug": "chatgpt-codex-connector",
+            "body": (f"AI-INTEGRATION-COMMAND\nid: {command}\nfrom: ChatGPT\ntarget: memory\n"
+                     "scope: coordination\ntask: Report synthetic status for the authorized task."),
+        }
+        with self.assertRaisesRegex(ValueError, "unverified publication"):
+            observe({**publication, "app_id": 1})
+        self.assertEqual(observe(publication)["status"], "SENT")
+        result = f"AI-INTEGRATION-RESULT\nid: {command}\nreceipt_id: RESULT:{command}:1\nin_reply_to: 30\nstatus: DONE"
+        packet = {**publication, "kind": "receipt", "app_id": 1210556, "app_slug": "cursor", "comment": 32,
+                  "body": result + "\npart: 2/2\nevidence: fixture\n[I] second"}
+        with self.assertRaisesRegex(ValueError, "unverified receipt source"):
+            observe({**packet, "app_slug": "wrong"})
+        self.assertEqual(observe(packet)["status"], "INCOMPLETE")
+        self.assertEqual(observe(packet)["status"], "DUPLICATE_PART")
+        self.assertEqual(observe({**packet, "comment": 31,
+                                  "body": result + "\npart: 1/2\nevidence: fixture\n[S] first"})["receipt_status"], "DONE")
+        self.assertEqual(self.open().status()["m1"], "READY")
+        self.assertEqual(observe({**packet, "comment": 33, "body": packet["body"] + " edited"})["status"], "AMBIGUOUS")
