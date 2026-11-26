@@ -49,11 +49,17 @@ class QueueTests(unittest.TestCase):
         self.config["observations"]["example/alpha#1"]["head"] = "c" * 40
         self.assertEqual(self.queue.complete("r1", lease, self.config, self.evidence)["status"], "STALE")
         self.queue.add([self.dev])
-        self.assertEqual(self.queue.claim(self.config)["status"], "CLAIMED")
+        work = self.queue.claim(self.config)
+        self.assertEqual(work["status"], "CLAIMED")
         self.now += 901
         self.assertEqual(self.open().claim(self.config)["status"], "NOOP")
         self.assertEqual(self.queue.status()["d1"], "UNCONFIRMED")
-        self.queue.reconcile("d1", RUN)
+        with self.assertRaisesRegex(ValueError, "verified recovery"):
+            self.queue.reconcile("d1", RUN, self.config)
+        run = "https://github.com/example/beta/actions/runs/123"
+        self.config["recovery"] = {"d1": {"lease": work["lease"], "run": run,
+                                           "no_active_or_external_effect": True}}
+        self.queue.reconcile("d1", run, self.config)
         self.assertEqual(self.open().claim(self.config)["status"], "NOOP")
 
     def test_blocked_dependencies_budget_authority_and_external_role(self):
@@ -82,3 +88,69 @@ class QueueTests(unittest.TestCase):
         self.evidence["tested_sha"] = BASE
         self.assertEqual(self.queue.complete("r1", lease, self.config, self.evidence)["status"], "BLOCKED")
         self.assertEqual(self.queue.final_requests(self.config), [])
+
+    def test_alias_dependency_unblocks_only_after_exact_independent_review(self):
+        alias = replace(self.review, id="alias-r1")
+        self.queue.add([self.review, alias, replace(self.dev, dependencies=("alias-r1",))])
+        work = self.queue.claim(self.config)
+        self.queue.complete("r1", work["lease"], self.config, self.evidence)
+        self.assertEqual(self.queue.claim(self.config)["status"], "NOOP")
+        self.config["final_capacity_confirmed"] = True
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            outcomes = list(pool.map(lambda _: self.open().final_claim(self.config, "chatgpt"), range(2)))
+        self.assertCountEqual([result["status"] for result in outcomes], ["CLAIMED", "NOOP"])
+        lease = next(item["lease"] for item in outcomes if item["status"] == "CLAIMED")
+        decision = {"task_id": "r1", "lease": lease, "head": HEAD, "base": BASE, "authorization": "approval-1",
+                    "outcome": "PASS", "evidence": "https://github.com/example/alpha/pull/1#pullrequestreview-15"}
+        self.assertEqual(self.open().final_decide(self.config, "chatgpt", {**decision, "head": BASE}),
+                         {"status": "STALE"})
+        self.assertEqual(self.open().final_decide(self.config, "chatgpt", decision)["status"], "BLOCKED")
+        self.config["final_evidence"] = {"r1": {
+            **{k: decision[k] for k in ("head", "base", "authorization", "outcome", "evidence")}, "reviewer": "chatgpt",
+        }}
+        outcome = self.open().final_decide(self.config, "chatgpt", decision)
+        self.assertEqual(outcome, {"status": "DONE", "merge": "AUTHOR_REQUIRED"})
+        self.assertTrue(self.open().final_decide(self.config, "chatgpt", decision)["duplicate"])
+        self.assertEqual(self.open().claim(self.config)["task"]["id"], "d1")
+
+    def test_final_claim_requires_proof_before_recovery(self):
+        self.queue.add([self.review])
+        work = self.queue.claim(self.config)
+        self.queue.complete("r1", work["lease"], self.config, self.evidence)
+        self.config["final_capacity_confirmed"] = True
+        claim = self.queue.final_claim(self.config, "chatgpt")
+        self.now += 901
+        self.config["observations"]["example/alpha#1"]["checked"] = self.now
+        self.assertEqual(self.open().final_claim(self.config, "chatgpt")["status"], "NOOP")
+        with self.assertRaises(ValueError):
+            self.queue.final_reconcile(self.config, "r1", RUN)
+        self.config["final_recovery"] = {"r1": {"lease": claim["lease"], "run": RUN,
+                                                "no_active_or_external_effect": True}}
+        self.queue.final_reconcile(self.config, "r1", RUN)
+        self.assertNotEqual(self.open().final_claim(self.config, "chatgpt")["lease"], claim["lease"])
+
+    def test_authorization_update_can_restore_unclaimed_work_without_duplicate(self):
+        self.queue.add([self.dev])
+        self.config["authorizations"] = {"renewed": "approval-3"}
+        self.queue.add([replace(self.dev, id="renewed", authorization="approval-3")], self.config)
+        work = self.queue.claim(self.config)
+        self.assertEqual((work["task"]["id"], work["task"]["authorization"]), ("d1", "approval-3"))
+        self.assertEqual(self.queue.status(), {"d1": "CLAIMED"})
+
+    def test_handoff_observation_is_durable_and_never_claims_execution(self):
+        memory = Task("m1", "example/alpha", "memory", "auth", 30, 1)
+        self.queue.add([memory])
+        packet = {"version": "control-v1.0", "task_id": "m1", "authorization": "auth",
+                  "repository": "lastgloaming/ai-writer", "pr": 3, "control_id": "fixture-1",
+                  "publisher_app_id": 12, "publication": 20, "receipt": 21}
+        self.config["authorizations"]["m1"] = "auth"
+        with self.assertRaises(ValueError):
+            self.queue.associate_handoff(self.config, packet)
+        self.config["verified_handoffs"] = {"m1": packet}
+        self.assertEqual(self.queue.associate_handoff(self.config, packet)["execution"], "UNVERIFIED")
+        self.assertEqual(self.open().associate_handoff(self.config, packet)["association"], "RECORDED")
+        alternate = {**packet, "receipt": 22}
+        self.config["verified_handoffs"] = {"m1": alternate}
+        with self.assertRaisesRegex(ValueError, "conflicting"):
+            self.open().associate_handoff(self.config, alternate)
+        self.assertEqual(self.open().status()["m1"], "READY")

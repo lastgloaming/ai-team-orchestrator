@@ -60,3 +60,25 @@ python3.12 -m venv /path/to/private/orch-venv
 设 `ORCHESTRATOR_V1_STOP=1` 或配置 stop=true 阻止新领取。保留数据库及一致性备份，停止消费者后再恢复软件版本。不得回退或另建空台账以重复领取。过期领取进入 UNCONFIRMED，后续领取停止，需独立检查旧工作和外部副作用。凭经核对的 run 调用 `reconcile --task ID --run URL` 将旧领取记为 BLOCKED，允许其他任务继续。恢复不回放旧领取或退还预留。校验失败时保留原台账及日志，不自动重建。
 
 验证命令为 `python3.12 -B -m unittest discover -s tests -v`。全程使用合成测试和临时数据库。
+
+## 云端运行桥与实际可用边界
+
+运行组件为 `orchestrator-v1-bridge --db /private/queue.sqlite --config /private/task-policy.json`，绑定主机回环地址。将进程及私有持久卷放在作者已经允许、能随电脑关机继续工作的常驻云宿主。由该宿主现有受信 TLS 代理暴露给获准的消费者；没有该代理时仅允许同宿主进程访问。需要固定容量及受监管进程管理、连接超时、备份和重启策略。不要将此 HTTP 入口直接公开。当前 Codex Cloud 仅核实为任务工作区，未取得常驻主机、稳定私有卷、私有 TLS 或入站连接许可。GitHub hosted runner 随作业退出，公开状态分支不能承载此私有台账。**实际云端托管和外部消费者连通性仍为 BLOCKED**。本 PR 不启动云端进程、不改变巡检。若作者没有符合条件的既有主机，保持关闭，不引入付费资源。
+
+桥接凭证通过环境变量 ORCHESTRATOR_V1_BRIDGE_TOKENS 注入 JSON，四个角色 observer、codex、chatgpt、operator 使用不同的随机 bearer。仅可信宿主管理者可编辑配置和绑定凭证。共享账号评论、GitHub login、正文和未验证的 App ID 不能建立角色绑定。现有 ChatGPT/Codex 自动任务是否能够调用私有桥仍需另批连通验证。终审证据独立读取后写入可信配置；只给出 PR 链接并不构成证明。
+
+### V1 事件与审批闭环
+
+- POST /v1/event（observer）接收已审核配置中的 task_id。事件的认证与 PR/CI 元数据核验由受信上游完成。接口不从正文生成任务，不让请求覆盖授权、HEAD 或预算。配置应原子替换，由已验证的读路径及时刷新。
+- POST /v1/next（codex）在同一持久台账按优先级、精确版本、有效授权和有效依赖领取。已有巡检可在下一次唤醒访问；生产变更需单独批准。POST /v1/result（codex）提交 task_id、lease、evidence，生成重要审核的终审任务。结算后消费者可请求下一次决策；未成功确认结算时先核对，不能重做工作。
+- POST /v1/final/claim（chatgpt）仅由独立接收方使用。须配置 final_capacity_confirmed=true 证明现有套餐可覆盖。终审核对完整 HEAD、base、授权和已核验测试证据，并返回独立租约。POST /v1/final/result 提交 task_id、lease、head、base、authorization、outcome 和 GitHub 审核链接 evidence。可信上游另在 final_evidence[task_id] 记录匹配的 head、base、authorization、outcome、evidence、reviewer=chatgpt 后才可入账。相同决策去重。PASS 解开仍有效的技术依赖，合并仍为 AUTHOR_REQUIRED。旧 HEAD、改授权、缺独立证据无法解锁。
+- 兼容同逻辑任务别名，依赖指向规范记录。新的可信授权可替换未领取任务、尚未被领取的终审以及有独立无副作用恢复证明的任务。完成的技术审核不因重复配置重跑。过期的普通和终审租约均握持到独立核对。POST /v1/reconcile 或 /v1/final/reconcile（operator）要求专属于该任务仓库的 run URL，以及 recovery 或 final_recovery 中精确对应 lease、run 且 no_active_or_external_effect=true 的可信证明。不能用另一仓库链接解锁，确认不明时不回放。
+- 普通任务的 units=0 也至少预留一单位。预算 window、remaining、reserve 是已验证套餐的可信快照，不能从事件传入。单独的 ChatGPT 容量证明确认不了就不领终审。保留既有停用开关。DeepSeek Advisor 和 P5 私有调度接口保留，中央决策当前使用确定性规则，全部真实费用与部署硬阻断仍有效。
+
+### Integration 与其它角色
+
+POST /v1/handoffs 仅导出外部角色的 BLOCKED 请求。POST /v1/handoffs/observe（operator）仅核验并持久关联另行查证的 v1.0 传输证据：task_id、authorization、Control ID、目标仓库和 PR、publisher_app_id、publication 评论 ID 及严格在其后的 receipt 评论 ID。packet 必须等于可信配置中的 verified_handoffs[task_id]。完全相同的记录可回读，冲突拒绝。关联不等于已执行，不能解除依赖。
+
+真实分发仍需接收端已审核补丁的确切版本，以及独占编号、发送 App 元数据、评论绑定、分段回执和持久对账合同。只读核查到的 Control PR #3 Git HEAD 仍为 2f0b00de20dac36a6b4f3d1e3eca47c63346ee60，未独立取得补丁并不能验证真实兼容。本 PR 继续沿用当前 v1.0 解析的保守边界，零匹配或多匹配时禁止补发。没有经过核验的 ChatGPT 发布能力，不利用 GITHUB_TOKEN 假装 ChatGPT App。Writer 现有 GitHub 更新路径不改，Memory 经 Integration，Editor 未接入。不得向公网台账写入真实任务、账单、凭证或正文。
+
+**验证**：本地 HTTP 集成用例覆盖事件→可信策略决定→Codex 领取→结果→独立 ChatGPT 领取与回传→下一项可领取任务。它没有验证公网托管或真实连接器身份。已安装包的 CLI 验证为 bash scripts/check_v1_install.sh；已有 setuptools>=68 时该脚本在临时目录离线构建，在仓库之外运行已安装入口。

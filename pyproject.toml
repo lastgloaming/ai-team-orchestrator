@@ -10,6 +10,7 @@ dependencies = []
 
 [project.scripts]
 orchestrator-v1 = "orchestrator.v1:main"
+orchestrator-v1-bridge = "orchestrator.v1_bridge:main"
 
 [tool.setuptools.packages.find]
 include = ["orchestrator*"]
