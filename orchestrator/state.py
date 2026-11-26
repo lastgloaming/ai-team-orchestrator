@@ -22,6 +22,8 @@ class StateConflict(RuntimeError):
 
 
 class GitState:
+    git_token = None
+
     def __init__(self, remote, checkpoint=None):
         if checkpoint is not None and not CHECKPOINT.fullmatch(checkpoint):
             raise ValueError("invalid state checkpoint")
@@ -35,10 +37,12 @@ class GitState:
         env.pop("ORCHESTRATOR_AUTO_REPLY_TOKEN", None)
         env.pop("GITHUB_TOKEN", None)
         token = env.pop("ORCHESTRATOR_STATE_TOKEN", None)
-        if self.remote == LIVE_REMOTE and token and (args[0] in {"ls-remote", "fetch"} or "push" in args):
+        env.pop("ORCHESTRATOR_P5_LEDGER_TOKEN", None)
+        token = self.git_token or (token if self.remote == LIVE_REMOTE else None)
+        if token and (args[0] in {"ls-remote", "fetch"} or "push" in args):
             auth = base64.b64encode(f"x-access-token:{token}".encode()).decode()
             env.update(GIT_CONFIG_COUNT="2",
-                       GIT_CONFIG_KEY_0="http.https://github.com/.extraheader",
+                       GIT_CONFIG_KEY_0=f"http.{self.remote}.extraheader",
                        GIT_CONFIG_VALUE_0=f"Authorization: Basic {auth}",
                        GIT_CONFIG_KEY_1="http.followRedirects", GIT_CONFIG_VALUE_1="false")
         return subprocess.run(

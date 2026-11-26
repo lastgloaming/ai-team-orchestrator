@@ -28,10 +28,10 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def live_transport(request, timeout):
+def live_transport(request, timeout, *, approval_env="ORCHESTRATOR_LIVE_APPROVED"):
     if os.environ.get("ORCHESTRATOR_STOP") == "1":
         raise BudgetExceeded("emergency stop")
-    if os.environ.get("ORCHESTRATOR_LIVE_APPROVED") != "1":
+    if os.environ.get(approval_env) != "1":
         raise RuntimeError("live transport requires explicit approval")
     key = os.environ.get("DEEPSEEK_API_KEY")
     if not key:
