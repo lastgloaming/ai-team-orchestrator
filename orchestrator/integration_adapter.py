@@ -258,7 +258,10 @@ def parse_receipt(body):
     kind, lines = _message_lines(body)
     if kind not in {"RESULT", "REVIEW"}:
         return read_historical_receipt(body)
-    fields = _read_fields(lines)
+    if any(re.match(r"^\s*(?:part|parts|section|continuation)\s*:", line, re.IGNORECASE)
+           for line in lines):
+        raise ValueError("multipart receipt requires reconciliation")
+    fields = _read_fields(lines, multiline=True)
     if fields.get("status") not in PROGRESS:
         return read_historical_receipt(body)
     if fields.keys() == {"id", "status", "evidence", "blockers"}:

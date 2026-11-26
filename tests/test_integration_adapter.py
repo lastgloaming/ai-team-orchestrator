@@ -210,3 +210,10 @@ IntegrationAdapter(sys.argv[1]).dispatch_mock(sys.argv[2], lambda _: os._exit(23
         self.restart().provision_mock_ids([legacy])
         self.assertEqual(self.send(legacy, self.forbidden), "BLOCKED")
         self.assertEqual(self.enqueue("new-event", "report_status"), "CMD-20990101-702")
+
+    def test_indented_multiline_result_does_not_accept_multipart_markers(self):
+        task = self.enqueue("multiline-fixture", "report_status")
+        self.assertEqual(self.send(task, self.comment), "SENT")
+        first = f"AI-INTEGRATION-RESULT\nid: {task}\nstatus: DONE\nevidence: fixture"
+        self.assertEqual(self.receipt(first + "\n  part: 1 of 2\nblockers: none"), "REJECTED")
+        self.assertEqual(self.receipt(first + "\n  synthetic continuation\nblockers: none", 22), "DONE")
