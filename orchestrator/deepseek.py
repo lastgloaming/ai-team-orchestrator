@@ -123,10 +123,10 @@ class Advisor:
                 (reservation,),
             ).rowcount)
 
-    def suggest(self, status):
+    def request(self, status):
         if type(status) is not str or status not in STATES:
             raise ValueError("use an approved status code")
-        request = {
+        return {
             "model": self.limits.model, "max_tokens": self.limits.max_output,
             "response_format": {"type": "json_object"},
             "thinking": {"type": "disabled"},
@@ -136,6 +136,9 @@ class Advisor:
                 {"role": "user", "content": status},
             ],
         }
+
+    def suggest(self, status):
+        request = self.request(status)
         for attempt in range(self.limits.retries + 1):
             reservation = self._reserve()
             try:

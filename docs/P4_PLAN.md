@@ -47,3 +47,11 @@ ORCH-REV-20261126-001 提供了 2026-11-26 官方只读资料核对结果。本�
 4. 仅在作者明确批准单次费用上限后启用真实模型请求。一次超时、计费不符、身份无法归因或状态持久化失败即停止并保留证据。
 
 参考 [GitHub Actions 事件](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows)、[repository_dispatch 权限](https://docs.github.com/en/rest/repos/repos#create-a-repository-dispatch-event)、[Codex Action](https://github.com/openai/codex-action/tree/4aac6da4b686168e147798ca841cf64ff0f027b8)。
+
+## P4 实现及授权步骤
+
+- `p4-state` 由首次获批写入创建，根提交只包含 SQLite 台账。每次提交以读取版本为父提交，预推送检查核对远端公告的旧版本，Git 服务端再比较更新前的引用。冲突时重新下载台账并重放纯状态操作，最多四次。发送方须在提交成功后才确认事件已接收。同一 ID 与同一数据重复提交为幂等，不同数据被拒绝。调用方中断在提交前必须使用相同 ID 重试。状态分支历史应保留，不要删除或重置，否则已消费事件及一次性预算记录会丢失。
+- 独立工作流 `P4 gated verification` 仅支持可信 `main` 上的手动触发，当前 Draft 分支上的代码不会开启该入口。默认关闭。须由作者批准开启状态变量 `ORCHESTRATOR_P4_STATE_APPROVED` 及使用已有的独立仓库状态写入凭证 `ORCHESTRATOR_STATE_TOKEN`。工作流自己的 GitHub token 保持只读。先以 `enqueue-probe` 持久化一个合成事件，再从另一次运行触发 `prepare-probe` 取得相同 ID 的合成握手，重复入队验证去重。断在消费提交前的事件应在下一次运行可取。这个入口仅实现合成探针的入队，服务端自动收件及可信 webhook 中继仍待单独批准与实现。
+- `deepseek-once` 另需 `ORCHESTRATOR_LIVE_APPROVED=1`、Actions Secret `DEEPSEEK_API_KEY`、作者批准的 `ORCHESTRATOR_P4_BUDGET_NANODOLLARS` 和已独立验证的 `ORCHESTRATOR_P4_INPUT_TOKEN_BOUND`。固定 Flash、关闭思考、输出最多 64 token、零重试。请求前先远程提交一次性标记和预留。请求、远端确认或账本结算不明确时不得清除标记重发。按 usage 和账单人工验收，保留日志中的结果状态和台账 SHA。
+- `send-probe` 另需 `ORCHESTRATOR_P4_PROBE_APPROVED=1`、经批准的独立仓库测试 PR 编号 `ORCHESTRATOR_P4_TEST_PR` 和已有评论发送凭证 `ORCHESTRATOR_PROBE_TOKEN`。先确认 Integration 已注册该隔离入口且有独立可认证身份。发件前先提交一次性领取记录，发送至独立仓库测试 PR。若超时，通过任务 ID 查找评论及回执，禁止自动重发或改 ID 绕过。记录发送评论 ID、ACK/RESULT 评论 ID 与可验证的 GitHub 主体，分别核对两个发送者均为预期独立 ID，并排除共享账号。用 `verify_probe` 校验同一任务 ID 和两种状态。缺少独立身份、超时、只有转发或没有两条回执时，保持未验收。
+- 本轮仅使用本地裸 Git 仓库和 Mock HTTP。真实状态分支创建、跨工作流测试、付费调用及外部 Bot 触发均须单独批准。
