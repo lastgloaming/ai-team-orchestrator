@@ -129,9 +129,10 @@ class Advisor:
         request = {
             "model": self.limits.model, "max_tokens": self.limits.max_output,
             "response_format": {"type": "json_object"},
+            "thinking": {"type": "disabled"},
             "messages": [
                 {"role": "system", "content": "Return a JSON object with only suggestion. "
-                 "Choose inspect_status, check_blockers, or escalate. Do not propose actions."},
+                 'Choose inspect_status, check_blockers, or escalate. Example: {"suggestion":"inspect_status"}.'},
                 {"role": "user", "content": status},
             ],
         }

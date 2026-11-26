@@ -2,14 +2,14 @@
 
 ## 协议证据与身份
 
-2026-11-26 重读 AI Writer PR #3 Git head `2f0b00de20dac36a6b4f3d1e3eca47c63346ee60` 的 `docs/integration/CONTROL.md`。Git 可读 PR head，不能从中取得评论。GitHub Comments API 返回 403，未登录网页返回 404。等待已有连接器导出的四类脱敏原文与评论链接，再确认空行、字段顺序、多行、状态和 Integration 转述惯例。当前合成测试只证明与文档中的四种格式兼容，不把文档声明当作实测。
+2026-11-26 重读 AI Writer PR #3 Git head `2f0b00de20dac36a6b4f3d1e3eca47c63346ee60` 的 `docs/integration/CONTROL.md`。Git 可读 PR head，不能从中取得评论。GitHub Comments API 返回 403，未登录网页返回 404。ORCH-REV-20261126-001 通过已有连接器提供了四类历史证据及 ACK/RESULT 准确样例。历史回执已纳入只读解析，现有唤醒和 Integration 委托仍未实测。
 
 最低权限方案分两步：
 
 1. **人工启动。** 在独立仓库受保护的测试入口由已授权操作者重新提交合成结构化命令。启用后由作者明确限定可按入口启动的操作者。共享 `lastgloaming` 可作为线索来源，不能当作作者、ChatGPT 或执行端的可归因身份，也不能仅凭同账号的另一次确认解除歧义。人工启动只代表已批准的测试作用域，不替代角色签名。
 2. **可归因自动化。** 如果作者批准新增 GitHub App，源仓库的读取接收器仅订阅 `issue_comment`，用满足该事件的最低读取权限验证原始请求 HMAC、安装 ID、仓库 ID、PR 编号、`created`、delivery ID 与发送者。App 的签名只证明 GitHub 投递，角色仍由受信任且独立的主体映射。能使用独立 App 的执行端按稳定 Bot ID 绑定单一角色。共享账号的执行端若支持调用外部接口，可使用各自的短期凭据或独立签名密钥，签名覆盖任务 ID、动作、目标、时间窗口和 nonce，持久层防重放。无能力出示独立身份的执行端保持人工转交。若采用 `repository_dispatch`，该端点要求目标仓库 Contents: write，需仅限独立仓库的单独短时凭证，不给源仓库接收器该权限。优先使用认证的持久 inbox 和人工/定时消费者来避免新增跨仓库写权限。
 
-若正式源仓库不能安装 App 或改动默认分支，保留人工转交。作者可另行考虑独立仓库的定时只读轮询，经批准使用现有仓库读取凭证。轮询可能延迟，不能提供即时唤醒。评论发送、身份认证和实际执行端响应分别验收。
+默认事件驱动，使用独立持久 ingress 保存已认证事件后再唤醒消费者。没有可用的 App、可信 ingress 或已批准入口时保留人工转交。评论发送、身份认证和实际执行端响应分别验收。
 
 ## 执行端入口
 
@@ -31,9 +31,13 @@ Actions concurrency 是优化。新任务可能替换排队运行，需用持久
 
 ## DeepSeek 与最小费用
 
-官方 [模型和价格](https://api-docs.deepseek.com/quick_start/pricing) 和 [Chat Completions](https://api-docs.deepseek.com/api/create-chat-completion) 在当前云环境返回 403，平台页面也不可达。可读的 [DeepSeek-V3.2 官方模型仓库](https://github.com/deepseek-ai/DeepSeek-V3.2/tree/87e509a2e5a100d221c97df52c6e8be7835f0057) 能证明该开源发布，无法确认 2026-11-26 商用 API 的模型别名、价格或可用性。原型使用 OpenAI 兼容请求形状 `POST /chat/completions`，含 `response_format: {"type":"json_object"}` 和 `max_tokens`，均须按当期目标模型文档核验。P4 前从官方价格表取得日期、币种、缓存命中/未命中输入费率、输出费率、思考 token 计费与支持参数；从已有授权的读取渠道核对可用模型，并选可关闭思考且支持 JSON 的最低成本模型。暂不设真实模型默认值，也不填写推测费率。
+ORCH-REV-20261126-001 提供了 2026-11-26 官方只读资料核对结果。本云环境依然无法直接读取 API 文档。按该记录，`deepseek-flash` 对应 DeepSeek-V4.1-Flash-1017。每百万 token 的美元峰值费率，输入命中 / 未命中 / 输出分别为 0.006 / 0.30 / 1.20，非峰为一半。中国区人民币峰值为 0.04 / 2 / 8。`deepseek-v4-pro` 的美元峰值费率为 0.044 / 1.32 / 3.96。实际账号模型可用性及账单尚未验证。 [价格](https://api-docs.deepseek.com/quick_start/pricing/) · [请求参数](https://api-docs.deepseek.com/api/create-chat-completion/) · [JSON 模式](https://api-docs.deepseek.com/guides/json_mode/)
 
-最小付费验证为一次合成状态建议、并发 1、日/月各 1 次、零重试。拟测试输出上限为 64 tokens，须先确认供应商参数限制和思考模式。保守预留上限为 `(核实的输入 token 上界 × 缓存未命中单价 + 64 × 输出单价) / 1,000,000`，单价以每百万 token 报价，实际结果按返回 usage 和供应商账单核对。若存在最低计费、思考开销或税费，须一并计入。美元数值等待官方费率与参数核实，在此之前无法定出可审批金额。现有 Actions 私库额度和 Codex 费用单独核实。
+拟用 `POST https://api.deepseek.com/chat/completions`，指定 `deepseek-flash`、`thinking: {"type":"disabled"}`、`response_format: {"type":"json_object"}` 及 `max_tokens: 64`。并发 1、日/月各 1 次、零重试。按 1,024 输入 token 和 64 输出 token 的峰值估算为 0.000384 美元，输入上界必须在实测前独立证明。这只是样例估值，实际可审批上限还要核对供应商限制、计费与币种。
+
+## 隔离 CI 的证据范围
+
+现有 Mock CI 的 `isolated-prepare` 和 `isolated-restore` 使用两个独立 runner，使用同一次运行的一天期制品传递合成 SQLite 快照。覆盖认证、共享账号拒绝、篡改、领取后未发送、恢复去重、模拟执行端回执和已消耗的单次模型预算。测试凭据是公开合成值，模型使用注入 Mock，`ORCHESTRATOR_LIVE_APPROVED=0`。真实事件收件入口、状态分支争用与 CAS、跨运行持久化和外部执行端仍待验证。制品仅用于隔离 CI。
 
 ## 执行顺序与停止条件
 

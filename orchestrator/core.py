@@ -48,42 +48,85 @@ class Message:
     fields: dict[str, str]
 
 
-def parse(body):
+EXECUTABLE_FIELDS = {
+    "COMMAND": {"id", "from", "target", "scope", "task"},
+    "REVIEW": {"id", "from", "target", "scope", "task", "ref"},
+    "RESULT": {"id", "status", "evidence", "blockers"},
+}
+RECEIPT_FIELDS = {
+    "ACK": {"id", "status", "reason"},
+    "RESULT": EXECUTABLE_FIELDS["RESULT"],
+}
+HISTORICAL_FIELDS = {
+    "ACK": {"protocol", "from", "to", "command_id", "status", "reason"},
+    "RESULT": {"protocol", "from", "to", "command_id", "status", "evidence"},
+}
+RECEIPT_STATUS = {
+    "ACK": {"ACCEPTED", "REJECTED", "DUPLICATE", "BLOCKED"},
+    "RESULT": {"DONE", "BLOCKED"},
+}
+
+
+def _message_lines(body):
     if not isinstance(body, str) or len(body) > 8192:
         raise ValueError("invalid body")
     body = body.replace("\r\n", "\n")
-    lines = body.split("\n")
-    marker = lines[0]
-    formats = {
-        "COMMAND": {"id", "from", "target", "scope", "task"},
-        "REVIEW": {"id", "from", "target", "scope", "task", "ref"},
-        "ACK": {"id", "status", "reason"},
-        "RESULT": {"id", "status", "evidence", "blockers"},
-    }
-    kind = marker.removeprefix("AI-INTEGRATION-")
-    if marker != "AI-INTEGRATION-" + kind or kind not in formats:
-        return None
     if any(ord(char) < 32 and char not in "\n\t" for char in body):
         raise ValueError("invalid control character")
-    while lines and lines[-1] == "":
-        lines.pop()
+    marker, *lines = body.rstrip("\n").split("\n")
+    prefix = "AI-INTEGRATION-"
+    return marker[len(prefix):] if marker.startswith(prefix) else "", lines
+
+
+def _read_fields(lines, *, multiline=False):
     fields = {}
-    for line in lines[1:]:
+    key = None
+    for line in lines:
+        if multiline and line.startswith((" ", "\t")) and key in {"reason", "evidence", "blockers"}:
+            fields[key] += "\n" + line.strip()
+            continue
         key, separator, value = line.partition(":")
-        if not separator or key not in formats[kind] or key in fields or not value.strip():
+        if not separator or key in fields or not value.strip():
             raise ValueError("invalid field")
         fields[key] = value.strip()
-    if fields.keys() != formats[kind]:
-        raise ValueError("missing field")
-    for key in {"id", "ref"} & fields.keys():
+    return fields
+
+
+def _validate_fields(kind, fields, expected, id_key="id"):
+    if fields.keys() != expected:
+        raise ValueError("unexpected or missing fields")
+    for key in {id_key, "ref"} & fields.keys():
         if not IDENTIFIER.fullmatch(fields[key]):
             raise ValueError("invalid identifier")
-    statuses = {
-        "ACK": {"ACCEPTED", "REJECTED", "DUPLICATE", "BLOCKED"},
-        "RESULT": {"DONE", "BLOCKED"},
-    }
-    if kind in statuses and fields["status"] not in statuses[kind]:
+    if kind in RECEIPT_STATUS and fields["status"] not in RECEIPT_STATUS[kind]:
         raise ValueError("invalid status")
+
+
+def parse(body):
+    """Read the strict protocol used for authenticated state transitions."""
+    kind, lines = _message_lines(body)
+    if kind not in EXECUTABLE_FIELDS:
+        return None
+    fields = _read_fields(lines)
+    # Legacy receipts have their own read-only parser and cannot update state.
+    if kind == "RESULT" and fields.keys() == HISTORICAL_FIELDS["RESULT"]:
+        return None
+    _validate_fields(kind, fields, EXECUTABLE_FIELDS[kind])
+    return Message(kind, fields["id"], fields)
+
+
+def read_historical_receipt(body):
+    """Read receipt text for audit. Claimed identities are untrusted metadata."""
+    kind, lines = _message_lines(body)
+    if kind not in RECEIPT_FIELDS:
+        return None
+    fields = _read_fields(lines, multiline=True)
+    if "protocol" in fields:
+        if fields["protocol"] != "1.0":
+            raise ValueError("unknown receipt protocol")
+        _validate_fields(kind, fields, HISTORICAL_FIELDS[kind], "command_id")
+        return Message(kind, fields["command_id"], fields)
+    _validate_fields(kind, fields, RECEIPT_FIELDS[kind])
     return Message(kind, fields["id"], fields)
 
 
@@ -133,7 +176,7 @@ class Orchestrator:
             message = parse(body)
         except ValueError:
             return "REJECTED"
-        if message is None or message.kind == "ACK":
+        if message is None:
             return "IGNORED"
         with transaction(self.path) as db:
             if not db.execute("INSERT OR IGNORE INTO seen VALUES (?)", (delivery,)).rowcount:
