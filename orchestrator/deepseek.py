@@ -29,6 +29,8 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def live_transport(request, timeout):
+    if os.environ.get("ORCHESTRATOR_STOP") == "1":
+        raise BudgetExceeded("emergency stop")
     if os.environ.get("ORCHESTRATOR_LIVE_APPROVED") != "1":
         raise RuntimeError("live transport requires explicit approval")
     key = os.environ.get("DEEPSEEK_API_KEY")
@@ -85,9 +87,12 @@ class Advisor:
 
     def _reserve(self):
         limits = self.limits
-        day = self.now().astimezone(UTC).date().isoformat()
         amount = limits.input_ceiling * limits.input_rate + limits.max_output * limits.output_rate
         with transaction(self.path) as db:
+            clock = self.now()
+            if clock.utcoffset() is None:
+                raise ValueError("budget clock must have a timezone")
+            day = clock.astimezone(UTC).date().isoformat()
             if self.stopped() or os.environ.get("ORCHESTRATOR_STOP") == "1":
                 raise BudgetExceeded("emergency stop")
             if db.execute("SELECT 1 FROM usage WHERE state='overrun' LIMIT 1").fetchone():
@@ -109,6 +114,14 @@ class Advisor:
                 "INSERT INTO usage (day,model,amount,state,attempts) VALUES (?,?,?,'active',1)",
                 (day, limits.model, amount),
             ).lastrowid
+
+    def reconcile_terminated_attempt(self, reservation):
+        """Release the slot after an operator has verified the worker terminated."""
+        with transaction(self.path) as db:
+            return bool(db.execute(
+                "UPDATE usage SET state='uncertain' WHERE id=? AND state='active'",
+                (reservation,),
+            ).rowcount)
 
     def suggest(self, status):
         if type(status) is not str or status not in STATES:
@@ -133,7 +146,7 @@ class Advisor:
                 }
                 if not retryable or attempt == self.limits.retries:
                     raise RuntimeError("model request failed") from None
-            except (TypeError, ValueError, KeyError, IndexError) as error:
+            except (TypeError, ValueError, KeyError, IndexError):
                 raise InvalidResponse("malformed model response") from None
             finally:
                 # An ambiguous attempt keeps its full reserved amount.
@@ -154,8 +167,12 @@ class Advisor:
             raise InvalidResponse("usage outside reserved ceiling")
         amount = incoming * self.limits.input_rate + outgoing * self.limits.output_rate
         with transaction(self.path) as db:
-            db.execute("UPDATE usage SET amount=?,state='counted',input_tokens=?,output_tokens=? WHERE id=?",
-                       (amount, incoming, outgoing, reservation))
+            settled = db.execute("""
+                UPDATE usage SET amount=?,state='counted',input_tokens=?,output_tokens=?
+                WHERE id=? AND state='active'
+                """, (amount, incoming, outgoing, reservation)).rowcount
+            if not settled:
+                raise InvalidResponse("attempt already reconciled")
         choice = data["choices"][0]
         if choice["finish_reason"] != "stop":
             raise InvalidResponse("incomplete model response")

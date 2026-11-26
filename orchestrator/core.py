@@ -3,6 +3,8 @@
 import json
 import re
 import sqlite3
+import time
+import uuid
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 
@@ -19,6 +21,9 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE TABLE IF NOT EXISTS decisions (id TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS outbox (id TEXT PRIMARY KEY, payload TEXT NOT NULL,
   delivered INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS outbox_leases (
+  id TEXT PRIMARY KEY REFERENCES outbox(id), token TEXT NOT NULL, expires_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS usage (
   id INTEGER PRIMARY KEY, day TEXT NOT NULL, model TEXT NOT NULL,
   amount INTEGER NOT NULL, state TEXT NOT NULL,
@@ -30,6 +35,7 @@ CREATE TABLE IF NOT EXISTS usage (
 @contextmanager
 def transaction(path):
     with closing(sqlite3.connect(path, timeout=10)) as db, db:
+        db.execute("PRAGMA foreign_keys = ON")
         db.executescript(SCHEMA)
         db.execute("BEGIN IMMEDIATE")
         yield db
@@ -45,16 +51,22 @@ class Message:
 def parse(body):
     if not isinstance(body, str) or len(body) > 8192:
         raise ValueError("invalid body")
-    lines = body.splitlines()
-    marker = lines[0] if lines else ""
+    body = body.replace("\r\n", "\n")
+    lines = body.split("\n")
+    marker = lines[0]
     formats = {
         "COMMAND": {"id", "from", "target", "scope", "task"},
         "REVIEW": {"id", "from", "target", "scope", "task", "ref"},
+        "ACK": {"id", "status", "reason"},
         "RESULT": {"id", "status", "evidence", "blockers"},
     }
     kind = marker.removeprefix("AI-INTEGRATION-")
     if marker != "AI-INTEGRATION-" + kind or kind not in formats:
         return None
+    if any(ord(char) < 32 and char not in "\n\t" for char in body):
+        raise ValueError("invalid control character")
+    while lines and lines[-1] == "":
+        lines.pop()
     fields = {}
     for line in lines[1:]:
         key, separator, value = line.partition(":")
@@ -66,6 +78,12 @@ def parse(body):
     for key in {"id", "ref"} & fields.keys():
         if not IDENTIFIER.fullmatch(fields[key]):
             raise ValueError("invalid identifier")
+    statuses = {
+        "ACK": {"ACCEPTED", "REJECTED", "DUPLICATE", "BLOCKED"},
+        "RESULT": {"DONE", "BLOCKED"},
+    }
+    if kind in statuses and fields["status"] not in statuses[kind]:
+        raise ValueError("invalid status")
     return Message(kind, fields["id"], fields)
 
 
@@ -74,12 +92,14 @@ def event_metadata(event):
         comment = event["comment"]
         actor = event["sender"]["id"]
         delivery = comment["id"]
+        comment_actor = comment["user"]["id"]
         issue = event["issue"]
         if (event["action"] != "created" or
                 event["repository"]["full_name"] != "lastgloaming/ai-writer" or
                 issue["number"] != 3 or not isinstance(issue["pull_request"], dict) or
-                type(actor) is not int or actor <= 0 or actor != comment["user"]["id"] or
-                type(delivery) is not int or delivery <= 0):
+                type(actor) is not int or not 0 < actor < 2**63 or
+                type(comment_actor) is not int or actor != comment_actor or
+                type(delivery) is not int or not 0 < delivery < 2**63):
             return None
         return actor, delivery, comment["body"]
     except (KeyError, TypeError):
@@ -87,13 +107,18 @@ def event_metadata(event):
 
 
 class Orchestrator:
-    def __init__(self, path, principals, shared_ids):
-        if not shared_ids or principals.keys() & set(shared_ids):
+    def __init__(self, path, principals, shared_ids, *, now=time.time):
+        shared_ids = set(shared_ids)
+        if any(type(identity) is not int or not 0 < identity < 2**63
+               for identity in principals.keys() | shared_ids):
+            raise ValueError("require valid numeric GitHub IDs")
+        if not shared_ids or principals.keys() & shared_ids:
             raise ValueError("identify and exclude shared accounts")
         if not set(principals.values()) <= ROLES or len(set(principals.values())) != len(principals):
             raise ValueError("require distinct known roles")
         self.path = path
         self.principals = dict(principals)
+        self.now = now
 
     def process(self, event):
         """Accept only payloads from an already authenticated event adapter."""
@@ -108,7 +133,7 @@ class Orchestrator:
             message = parse(body)
         except ValueError:
             return "REJECTED"
-        if message is None:
+        if message is None or message.kind == "ACK":
             return "IGNORED"
         with transaction(self.path) as db:
             if not db.execute("INSERT OR IGNORE INTO seen VALUES (?)", (delivery,)).rowcount:
@@ -144,8 +169,6 @@ class Orchestrator:
         if not row or role != row[1]:
             return "UNAUTHORIZED"
         status = message.fields["status"]
-        if status not in {"DONE", "BLOCKED"}:
-            return "REJECTED"
         if row[3] != "ACCEPTED":
             return "IGNORED"
         db.execute("UPDATE tasks SET status=? WHERE id=?", (status, message.id))
@@ -162,10 +185,11 @@ class Orchestrator:
             fields["target"], fields["scope"]
         ):
             return "UNAUTHORIZED"
+        if db.execute("SELECT 1 FROM decisions WHERE id=?", (message.id,)).fetchone():
+            return "DUPLICATE"
         if row[2] != "DONE" or fields["task"] != "record_review":
             return "REJECTED"
-        if not db.execute("INSERT OR IGNORE INTO decisions VALUES (?)", (message.id,)).rowcount:
-            return "DUPLICATE"
+        db.execute("INSERT INTO decisions VALUES (?)", (message.id,))
         db.execute("UPDATE tasks SET status='REVIEWED' WHERE id=?", (ref,))
         self._emit(db, "REVIEW", message.id, role, "author", row[1], "REVIEWED", task_id=ref)
         return "REVIEWED"
@@ -183,6 +207,35 @@ class Orchestrator:
                 "SELECT payload FROM outbox WHERE delivered=0 ORDER BY rowid"
             )]
 
-    def mark_delivered(self, message_id):
+    def claim_next(self, lease_seconds=60):
+        """Claim one message. Use payload["id"] as the stable destination idempotency key."""
+        if type(lease_seconds) is not int or not 1 <= lease_seconds <= 3600:
+            raise ValueError("lease_seconds out of range")
         with transaction(self.path) as db:
+            now = int(self.now() * 1000)
+            row = db.execute("""
+                SELECT o.id, o.payload FROM outbox o
+                LEFT JOIN outbox_leases l ON o.id = l.id
+                WHERE o.delivered = 0 AND (l.id IS NULL OR l.expires_at <= ?)
+                ORDER BY o.rowid LIMIT 1
+                """, (now,)).fetchone()
+            if row is None:
+                return None
+            message_id, payload = row
+            token = uuid.uuid4().hex
+            db.execute("""
+                INSERT INTO outbox_leases VALUES (?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET token=excluded.token, expires_at=excluded.expires_at
+                """, (message_id, token, now + lease_seconds * 1000))
+            return json.loads(payload), token
+
+    def mark_delivered(self, message_id, token):
+        """Acknowledge a successful delivery while its lease is still valid."""
+        with transaction(self.path) as db:
+            removed = db.execute("""
+                DELETE FROM outbox_leases WHERE id=? AND token=? AND expires_at>?
+                """, (message_id, token, int(self.now() * 1000))).rowcount
+            if not removed:
+                return False
             db.execute("UPDATE outbox SET delivered=1 WHERE id=?", (message_id,))
+            return True
