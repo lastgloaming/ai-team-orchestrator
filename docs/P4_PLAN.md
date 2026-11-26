@@ -80,3 +80,13 @@ The separate **Initialize isolated P4 state pair** workflow is manual and off by
 The optional `ORCHESTRATOR_AUTO_IDENTITY_MODE=shared-synthetic` accepts only the fixed synthetic marker on the configured isolated PR from the confirmed shared GitHub account (ID 338499555). This authenticates the GitHub account and does not attribute the request to any AI. Replies are explicitly synthetic and are published using the job's built-in GitHub Actions token, with `contents: read` and `pull-requests: write` only on that job. The separate independent job retains its existing token and distinct-identity checks. The built-in Actions bot is excluded as an inbound sender and recognized on reply receipts by its system login, numeric ID and type. The existing state credential is still used for atomic state and witness writes.
 
 This mode uses the existing schema-v2 state/checkpoint anchors. Configuration of a different mode after the first persisted binding is rejected; do not reset the ledger to switch identities. The enable flag remains off by default. Real Integration and model calls are outside this workflow.
+
+### P5 模拟调度联动
+
+现有 GitHub 工作流未接入调度器，也没有获得模型凭证。离线传输必须同时设置默认关闭的 `ORCHESTRATOR_MODEL_SCHEDULING_ENABLED=1`、注入 Mock 调度器并提交新的 `P5-SYNTHETIC-ADVICE` 合成事件。资格在首次入队时写入双分支台账。P4 历史事件和授权关闭时已收到的事件继续作为通信记录，重放不会补发模型资格。
+
+通信成功与调度状态分别返回。合成 ACK/RESULT 仅表示通信完成。预算拒绝、并发拒绝和停止均按事件持久化原因，不生成虚假的用量或预留。拒绝和不确定结果不会因预算、时间或配置变更自动重新评估。如需另一次试验，须显式授权一个新合成事件。已提交的 RESERVED 表示未确认，进程故障保留预留，禁止自动重发。只持久化允许的建议枚举；建议不会生成命令或改变合成回复。
+
+预留和一次性标记原子提交后才调用 Mock。Git 重试只重放台账操作。调度器强制 CNY 峰值费率、每日及每月上限 2.20 元、输出最多 64、并发 1、零重试。配对快照中的台账明确用于合成会计，与真实 P4 用量隔离。独立历史校验拒绝删除关联、重写已结算用量以及从历史通信反向补发资格。原有 schema v2 通信快照可只读加载。
+
+`ORCHESTRATOR_MODEL_STOP`（兼容原模型停止变量 `ORCHESTRATOR_STOP`）与 `ORCHESTRATOR_AUTO_COMMUNICATION_STOP` 独立。真实模型调用及台账部署仍需另行批准。

@@ -8,6 +8,7 @@ from contextlib import closing
 from pathlib import Path
 
 from .core import IDENTIFIER
+from .scheduling_ledger import check_transition, inspect_snapshot
 from .state import CHECKPOINT, GitState, StateConflict
 
 STATE = "refs/heads/p4-auto-test-state"
@@ -80,6 +81,8 @@ class PairedState(GitState):
         if len(states) != len(witnesses):
             raise StateConflict("unpaired state and checkpoint histories")
         previous = None
+        prior_ledger = None
+        ledger = root / "ledger.sqlite"
         for sequence, (state, witness) in enumerate(zip(states, witnesses, strict=True)):
             expected = dict(environment=self.environment, state=state, sequence=sequence, previous=previous)
             if self._record(root, witness) != expected:
@@ -89,8 +92,11 @@ class PairedState(GitState):
                 if parents != ([history[sequence - 1]] if sequence else []):
                     raise StateConflict("state pair must have linear histories")
             previous = witness
-        ledger = root / "ledger.sqlite"
-        ledger.write_bytes(self._object(root, tips[0], "ledger.sqlite"))
+            ledger.write_bytes(self._object(root, state, "ledger.sqlite"))
+            current_ledger = inspect_snapshot(ledger)
+            if prior_ledger is not None:
+                check_transition(prior_ledger, current_ledger)
+            prior_ledger = current_ledger
         self._check_ledger(ledger)
         return tips, len(states) - 1
 
@@ -168,10 +174,12 @@ class PairedState(GitState):
                     floor = self._floor = before
                     ledger = root / "ledger.sqlite"
                     snapshot = ledger.read_bytes()
+                    before_ledger = inspect_snapshot(ledger)
                     answer = mutate(ledger)
                     if snapshot == ledger.read_bytes():
                         return answer
                     self._check_ledger(ledger)
+                    check_transition(before_ledger, inspect_snapshot(ledger))
                     proposed, result = self._advance(root, before, sequence + 1)
                     observed = self._tips(root)
                 except (sqlite3.DatabaseError, subprocess.SubprocessError, ValueError) as error:

@@ -10,10 +10,14 @@ from pathlib import Path
 
 from .auto_state import PairedState
 from .deepseek import NoRedirect
+from .mock_scheduling import enabled as scheduling_enabled
+from .mock_scheduling import model_transaction
+from .scheduling_ledger import ModelOutcome
 from .state import LIVE_REMOTE, StateConflict
 
 REPOSITORY = "lastgloaming/ai-team-orchestrator"
 COMMAND = "P4-SYNTHETIC-COMMAND"
+SCHEDULING_COMMAND = "P5-SYNTHETIC-ADVICE"
 KINDS = ("ACK", "RESULT")
 SHARED_MODE = "shared-synthetic"
 INDEPENDENT_MODE = "independent"
@@ -53,8 +57,9 @@ class Binding:
             raise ValueError("independent mode requires distinct authenticated identities")
 
 
-def event_id(event, binding, actor):
+def event_id(event, binding, actor, *, allow_mock_event=False):
     """Only consume the trusted Actions event file, not an arbitrary HTTP payload."""
+    markers = (COMMAND, SCHEDULING_COMMAND) if allow_mock_event else (COMMAND,)
     try:
         repository, issue, comment = event["repository"], event["issue"], event["comment"]
         if (event["action"] != "created" or repository["full_name"] != REPOSITORY
@@ -64,14 +69,14 @@ def event_id(event, binding, actor):
                 or actor != str(binding.sender)
                 or any(not positive_id(value) or value != binding.sender
                        for value in (event["sender"]["id"], comment["user"]["id"]))
-                or comment["body"] != COMMAND or not positive_id(comment["id"])):
+                or comment["body"] not in markers or not positive_id(comment["id"])):
             return None
         return comment["id"]
     except (KeyError, TypeError):
         return None
 
 
-def _enqueue(ledger, event, binding):
+def _enqueue(ledger, event, binding, *, eligible=False):
     with closing(sqlite3.connect(ledger)) as db, db:
         values = (REPOSITORY, binding.repository_id, binding.pr, binding.sender, binding.publisher, binding.shared)
         db.execute("INSERT OR IGNORE INTO auto_binding VALUES (1, ?, ?, ?, ?, ?, ?)", values)
@@ -80,7 +85,10 @@ def _enqueue(ledger, event, binding):
         ).fetchone()
         if stored != values:
             raise StateConflict("configured identities or PR do not match the persisted synthetic binding")
-        db.execute("INSERT OR IGNORE INTO auto_inbox (id) VALUES (?)", (event,))
+        inserted = db.execute("INSERT OR IGNORE INTO auto_inbox (id) VALUES (?)", (event,)).rowcount
+    if inserted and eligible:
+        with model_transaction(ledger) as db:
+            db.execute("INSERT INTO auto_model_eligibility VALUES (?)", (event,))
 
 
 def _consume(ledger, event):
@@ -107,13 +115,28 @@ def _settle(ledger, message_id, comment_id):
             raise RuntimeError("claimed synthetic reply missing or conflicting")
 
 
-def process(state, event, binding, actor, publish, find_reply=None):
-    identifier = event_id(event, binding, actor)
+def _require_communication():
+    if os.environ.get("ORCHESTRATOR_AUTO_COMMUNICATION_STOP") == "1":
+        raise ReplyUnconfirmed("automatic communication stopped")
+
+
+@dataclass(frozen=True)
+class ProcessingResult:
+    communication_completed: bool
+    scheduling: ModelOutcome
+
+
+def process(state, event, binding, actor, publish, find_reply=None, *, schedule=None):
+    identifier = event_id(event, binding, actor, allow_mock_event=schedule is not None)
     if identifier is None:
         return False
-    state.update(lambda ledger: _enqueue(ledger, identifier, binding))
+    eligible = (schedule is not None and scheduling_enabled()
+                and event["comment"]["body"] == SCHEDULING_COMMAND)
+    state.update(lambda ledger: _enqueue(ledger, identifier, binding, eligible=eligible))
     state.update(lambda ledger: _consume(ledger, identifier))
+    scheduling = schedule(identifier) if schedule is not None else None
     for kind in KINDS:
+        _require_communication()
         message_id = f"{identifier}:{kind}"
         context = (" Shared-account test with no AI attribution." if binding.mode == SHARED_MODE else "")
         body = f"[ORCHESTRATOR SYNTHETIC {kind}]\n\nSynthetic test only.{context} Reply ID: `{message_id}`."
@@ -124,6 +147,7 @@ def process(state, event, binding, actor, publish, find_reply=None):
         except StateConflict:
             raise ReplyUnconfirmed("synthetic reply claim or status could not be confirmed") from None
         try:
+            _require_communication()
             sent = publish(body) if claimed else (find_reply(body) if find_reply else None)
         except ReplyUnconfirmed:
             raise
@@ -136,7 +160,7 @@ def process(state, event, binding, actor, publish, find_reply=None):
             state.update(lambda ledger: _settle(ledger, message_id, sent))
         except RuntimeError:
             raise ReplyUnconfirmed("synthetic reply settlement could not be confirmed") from None
-    return True
+    return ProcessingResult(True, scheduling) if scheduling is not None else True
 
 
 def _status(ledger, identifier):
@@ -174,6 +198,7 @@ def github_publisher(binding, token):
                 or repository["full_name"] != REPOSITORY or not positive_id(repository["id"])
                 or repository["id"] != binding.repository_id):
             raise ReplyUnconfirmed("target PR is closed or does not match binding")
+        _require_communication()
         request = urllib.request.Request(
             comments, headers=headers,
             data=json.dumps({"body": body}).encode(), method="POST",

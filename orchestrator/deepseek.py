@@ -81,13 +81,14 @@ class Limits:
 
 class Advisor:
     def __init__(self, path, limits, transport, *, stopped=lambda: False, pause=time.sleep,
-                 now=lambda: datetime.now(UTC)):
+                 now=lambda: datetime.now(UTC), ledger_transaction=transaction):
         self.path = path
         self.limits = limits
         self.transport = transport
         self.stopped = stopped
         self.pause = pause
         self.now = now
+        self.ledger_transaction = ledger_transaction
 
     def _require_currency(self, db):
         # Schema v1 model rows were exclusively denominated in USD.
@@ -101,7 +102,7 @@ class Advisor:
     def _reserve(self):
         limits = self.limits
         amount = limits.input_ceiling * limits.input_rate + limits.max_output * limits.output_rate
-        with transaction(self.path) as db:
+        with self.ledger_transaction(self.path) as db:
             clock = self.now()
             if clock.utcoffset() is None:
                 raise ValueError("budget clock must have a timezone")
@@ -131,7 +132,7 @@ class Advisor:
 
     def reconcile_terminated_attempt(self, reservation):
         """Release the slot after an operator has verified the worker terminated."""
-        with transaction(self.path) as db:
+        with self.ledger_transaction(self.path) as db:
             self._require_currency(db)
             return bool(db.execute(
                 "UPDATE usage SET state='uncertain' WHERE id=? AND state='active'",
@@ -179,12 +180,12 @@ class Advisor:
                 not 0 <= incoming <= self.limits.input_ceiling or
                 not 0 <= outgoing <= self.limits.max_output):
             # Stop subsequent calls pending operator reconciliation.
-            with transaction(self.path) as db:
+            with self.ledger_transaction(self.path) as db:
                 self._require_currency(db)
                 db.execute("UPDATE usage SET state='overrun' WHERE id=? AND state='active'", (reservation,))
             raise InvalidResponse("usage outside reserved ceiling")
         amount = incoming * self.limits.input_rate + outgoing * self.limits.output_rate
-        with transaction(self.path) as db:
+        with self.ledger_transaction(self.path) as db:
             self._require_currency(db)
             settled = db.execute("""
                 UPDATE usage SET amount=?,state='counted',input_tokens=?,output_tokens=?
