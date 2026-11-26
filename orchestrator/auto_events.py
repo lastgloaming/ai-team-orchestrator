@@ -10,11 +10,18 @@ from pathlib import Path
 
 from .auto_state import PairedState
 from .deepseek import NoRedirect
-from .state import LIVE_REMOTE
+from .state import LIVE_REMOTE, StateConflict
 
 REPOSITORY = "lastgloaming/ai-team-orchestrator"
 COMMAND = "P4-SYNTHETIC-COMMAND"
 KINDS = ("ACK", "RESULT")
+
+
+class ReplyUnconfirmed(RuntimeError):
+    """An incomplete synthetic task must produce a failing workflow result."""
+
+    def __init__(self, reason):
+        super().__init__(f"BLOCKED/UNCONFIRMED: {reason}")
 
 
 def positive_id(value):
@@ -53,8 +60,15 @@ def event_id(event, binding, actor):
         return None
 
 
-def _enqueue(ledger, event):
+def _enqueue(ledger, event, binding):
     with closing(sqlite3.connect(ledger)) as db, db:
+        values = (REPOSITORY, binding.repository_id, binding.pr, binding.sender, binding.publisher, binding.shared)
+        db.execute("INSERT OR IGNORE INTO auto_binding VALUES (1, ?, ?, ?, ?, ?, ?)", values)
+        stored = db.execute(
+            "SELECT repository, repository_id, pr, sender, publisher, shared FROM auto_binding WHERE singleton=1"
+        ).fetchone()
+        if stored != values:
+            raise StateConflict("configured identities or PR do not match the persisted synthetic binding")
         db.execute("INSERT OR IGNORE INTO auto_inbox (id) VALUES (?)", (event,))
 
 
@@ -86,26 +100,30 @@ def process(state, event, binding, actor, publish, find_reply=None):
     identifier = event_id(event, binding, actor)
     if identifier is None:
         return False
-    state.update(lambda ledger: _enqueue(ledger, identifier))
+    state.update(lambda ledger: _enqueue(ledger, identifier, binding))
     state.update(lambda ledger: _consume(ledger, identifier))
     for kind in KINDS:
         message_id = f"{identifier}:{kind}"
         body = f"[ORCHESTRATOR SYNTHETIC {kind}]\n\nSynthetic test only. Reply ID: `{message_id}`."
-        if state.update(lambda ledger: _claim(ledger, message_id)):
-            try:
-                sent = publish(body)
-                if not positive_id(sent):
-                    raise ValueError("invalid comment ID")
-            except Exception:
-                raise RuntimeError("synthetic reply unconfirmed; reconcile before sending again") from None
-        else:
-            if state.update(lambda ledger: _status(ledger, message_id)) == "sent":
+        try:
+            claimed = state.update(lambda ledger: _claim(ledger, message_id))
+            if not claimed and state.update(lambda ledger: _status(ledger, message_id)) == "sent":
                 continue
-            sent = find_reply(body) if find_reply else None
-            if not positive_id(sent):
-                # A missing observation cannot prove the comment was never sent.
-                return True
-        state.update(lambda ledger: _settle(ledger, message_id, sent))
+        except StateConflict:
+            raise ReplyUnconfirmed("synthetic reply claim or status could not be confirmed") from None
+        try:
+            sent = publish(body) if claimed else (find_reply(body) if find_reply else None)
+        except ReplyUnconfirmed:
+            raise
+        except Exception:
+            raise ReplyUnconfirmed("synthetic reply could not be verified") from None
+        if not positive_id(sent):
+            # Missing or ambiguous observations cannot prove the comment was never sent.
+            raise ReplyUnconfirmed("no unique authenticated synthetic reply was confirmed")
+        try:
+            state.update(lambda ledger: _settle(ledger, message_id, sent))
+        except RuntimeError:
+            raise ReplyUnconfirmed("synthetic reply settlement could not be confirmed") from None
     return True
 
 
@@ -127,15 +145,24 @@ def github_publisher(binding, token):
     def send(body):
         with opener.open(urllib.request.Request(f"{base}/user", headers=headers), timeout=10) as response:
             owner = json.load(response)["id"]
-        if owner != binding.publisher:
-            raise RuntimeError("unexpected reply account")
+        if not positive_id(owner) or owner != binding.publisher:
+            raise ReplyUnconfirmed("reply credential identity does not match binding")
+        pr_url = f"{base}/repos/{REPOSITORY}/pulls/{binding.pr}"
+        with opener.open(urllib.request.Request(pr_url, headers=headers), timeout=10) as response:
+            target = json.load(response)
+        repository = target["base"]["repo"]
+        if (target["state"] != "open" or target["number"] != binding.pr
+                or repository["full_name"] != REPOSITORY or not positive_id(repository["id"])
+                or repository["id"] != binding.repository_id):
+            raise ReplyUnconfirmed("target PR is closed or does not match binding")
         request = urllib.request.Request(
             comments, headers=headers,
             data=json.dumps({"body": body}).encode(), method="POST",
         )
         with opener.open(request, timeout=10) as response:
             result = json.load(response)
-        if result["user"]["id"] != binding.publisher:
+        author = result["user"]["id"]
+        if not positive_id(author) or author != binding.publisher:
             raise RuntimeError("unexpected reply author")
         return result["id"]
 
@@ -146,7 +173,8 @@ def github_publisher(binding, token):
             with opener.open(request, timeout=10) as response:
                 entries = json.load(response)
             matches.extend(entry["id"] for entry in entries
-                           if entry["user"]["id"] == binding.publisher and entry["body"] == body)
+                           if positive_id(entry["user"]["id"]) and entry["user"]["id"] == binding.publisher
+                           and entry["body"] == body)
             if len(entries) < 100:
                 return matches[0] if len(matches) == 1 else None
         return None
@@ -176,4 +204,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ReplyUnconfirmed as error:
+        raise SystemExit(str(error)) from None

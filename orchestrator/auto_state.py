@@ -15,7 +15,12 @@ WITNESS = "refs/heads/p4-auto-test-checkpoints"
 REFS = (STATE, WITNESS)
 
 SCHEMA = """
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
+CREATE TABLE auto_binding (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    repository TEXT NOT NULL, repository_id INTEGER NOT NULL, pr INTEGER NOT NULL,
+    sender INTEGER NOT NULL, publisher INTEGER NOT NULL, shared INTEGER NOT NULL
+);
 CREATE TABLE auto_inbox (
     id INTEGER PRIMARY KEY, consumed INTEGER NOT NULL DEFAULT 0
 );
@@ -93,9 +98,10 @@ class PairedState(GitState):
     def _check_ledger(ledger):
         with closing(sqlite3.connect(f"file:{ledger}?mode=ro", uri=True)) as db:
             if (db.execute("PRAGMA integrity_check").fetchone() != ("ok",)
-                    or db.execute("PRAGMA user_version").fetchone() != (1,)
+                    or db.execute("PRAGMA user_version").fetchone() != (2,)
                     or db.execute("PRAGMA foreign_key_check").fetchone() is not None):
                 raise StateConflict("invalid isolated ledger")
+            db.execute("SELECT repository, repository_id, pr, sender, publisher, shared FROM auto_binding LIMIT 0")
             db.execute("SELECT id, consumed FROM auto_inbox LIMIT 0")
             db.execute("SELECT id, event_id, kind, status, comment_id FROM auto_outbox LIMIT 0")
 

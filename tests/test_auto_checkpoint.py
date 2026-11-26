@@ -1,4 +1,6 @@
 import concurrent.futures
+import io
+import json
 import os
 import sqlite3
 import subprocess
@@ -9,7 +11,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from orchestrator.auto_events import Binding, COMMAND, REPOSITORY, event_id, main, process
+from orchestrator.auto_events import (Binding, COMMAND, REPOSITORY, ReplyUnconfirmed, event_id,
+                                      github_publisher, main, process)
 from orchestrator.auto_state import REFS, PairedState
 from orchestrator.state import StateConflict
 
@@ -159,19 +162,20 @@ class AutoCheckpointTests(unittest.TestCase):
                         raise subprocess.TimeoutExpired("simulated lost push confirmation", 45)
                 return result
 
-        with self.assertRaises(StateConflict):
+        with self.assertRaises(ReplyUnconfirmed):
             process(self.new_state(LostPush), self.event(), self.binding, "41", lambda _: self.fail("published"))
-        self.assertTrue(process(self.new_state(), self.event(), self.binding, "41",
-                                lambda _: self.fail("published after ambiguous claim")))
+        with self.assertRaisesRegex(ReplyUnconfirmed, "BLOCKED/UNCONFIRMED"):
+            process(self.new_state(), self.event(), self.binding, "41",
+                    lambda _: self.fail("published after ambiguous claim"))
         self.assertEqual(self.state.update(self.inspect), [(101, 1), (102, 0)])
 
     def test_abrupt_exit_after_inbox_commit_recovers(self):
         program = """
 import os, sys
-from orchestrator.auto_events import _enqueue
+from orchestrator.auto_events import Binding, _enqueue
 from orchestrator.auto_state import PairedState
 state = PairedState(sys.argv[1], "fixture", tuple(sys.argv[2:]))
-state.update(lambda path: _enqueue(path, 101))
+state.update(lambda path: _enqueue(path, 101, Binding(50, 2, 41, 42, 99)))
 os._exit(27)
 """
         child = subprocess.run([sys.executable, "-B", "-c", program, str(self.remote), *self.anchors],
@@ -190,7 +194,7 @@ os._exit(27)
             posted[body] = 123
             raise TimeoutError()
 
-        with self.assertRaisesRegex(RuntimeError, "unconfirmed"):
+        with self.assertRaisesRegex(ReplyUnconfirmed, "BLOCKED/UNCONFIRMED"):
             process(self.state, self.event(), self.binding, "41", broken)
         sent = []
         self.assertTrue(process(self.new_state(), self.event(), self.binding, "41",
@@ -209,3 +213,109 @@ os._exit(27)
         with patch.dict(os.environ, {}, clear=True), patch("orchestrator.auto_events.PairedState") as state:
             main()
             state.assert_not_called()
+
+    def test_same_event_concurrent_replay_blocks_until_first_reply_is_confirmed(self):
+        entered = threading.Event()
+        release = threading.Event()
+        posted = []
+
+        def publish(body):
+            posted.append(body)
+            if len(posted) == 1:
+                entered.set()
+                self.assertTrue(release.wait(10))
+            return len(posted)
+
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            first = pool.submit(process, self.new_state(), self.event(), self.binding, "41", publish)
+            try:
+                self.assertTrue(entered.wait(10))
+                with self.assertRaisesRegex(ReplyUnconfirmed, "BLOCKED/UNCONFIRMED"):
+                    process(self.new_state(), self.event(), self.binding, "41",
+                            lambda _: self.fail("same event published concurrently"))
+            finally:
+                release.set()
+            self.assertTrue(first.result(timeout=10))
+        self.assertTrue(process(self.new_state(), self.event(), self.binding, "41", publish))
+        self.assertEqual(len(posted), 2)
+
+    def test_binding_changes_reject_replay_before_lookup_or_send(self):
+        with self.assertRaises(ReplyUnconfirmed):
+            process(self.state, self.event(), self.binding, "41",
+                    lambda _: (_ for _ in ()).throw(TimeoutError()))
+        before = self.tips()
+        cases = (
+            Binding(51, 2, 41, 42, 99), Binding(50, 3, 41, 42, 99),
+            Binding(50, 2, 43, 42, 99), Binding(50, 2, 41, 44, 99),
+        )
+        for changed in cases:
+            with self.subTest(binding=changed):
+                event = self.event()
+                event["repository"]["id"] = changed.repository_id
+                event["issue"]["number"] = changed.pr
+                event["sender"]["id"] = event["comment"]["user"]["id"] = changed.sender
+                with self.assertRaisesRegex(StateConflict, "persisted synthetic binding"):
+                    process(self.new_state(), event, changed, str(changed.sender),
+                            lambda _: self.fail("replayed to different binding"),
+                            lambda _: self.fail("looked up reply in a different binding"))
+                self.assertEqual(self.tips(), before)
+
+    def test_interrupted_after_claim_blocks_replay_without_reposting(self):
+        program = """
+import os, sys
+from orchestrator.auto_events import Binding, _claim, _consume, _enqueue
+from orchestrator.auto_state import PairedState
+state = PairedState(sys.argv[1], "fixture", tuple(sys.argv[2:]))
+state.update(lambda path: _enqueue(path, 101, Binding(50, 2, 41, 42, 99)))
+state.update(lambda path: _consume(path, 101))
+assert state.update(lambda path: _claim(path, "101:ACK"))
+os._exit(28)
+"""
+        child = subprocess.run([sys.executable, "-B", "-c", program, str(self.remote), *self.anchors],
+                               env={**os.environ, "TMPDIR": str(self.root)}, timeout=20)
+        self.assertEqual(child.returncode, 28)
+        before = self.tips()
+        with self.assertRaisesRegex(ReplyUnconfirmed, "BLOCKED/UNCONFIRMED"):
+            process(self.new_state(), self.event(), self.binding, "41",
+                    lambda _: self.fail("interrupted claim silently reposted"), lambda _: None)
+        self.assertEqual(self.tips(), before)
+
+    def test_ambiguous_recovery_returns_blocked(self):
+        body = "[ORCHESTRATOR SYNTHETIC ACK]\n\nSynthetic test only. Reply ID: `101:ACK`."
+        with patch("orchestrator.auto_events.urllib.request.build_opener") as build:
+            build.return_value.open.return_value = io.BytesIO(json.dumps([
+                {"id": 7, "user": {"id": 42}, "body": body},
+                {"id": 8, "user": {"id": 42}, "body": body},
+            ]).encode())
+            _, find = github_publisher(self.binding, "fixture")
+            with self.assertRaises(ReplyUnconfirmed):
+                process(self.state, self.event(), self.binding, "41",
+                        lambda _: (_ for _ in ()).throw(TimeoutError()))
+            with self.assertRaisesRegex(ReplyUnconfirmed, "no unique authenticated"):
+                process(self.new_state(), self.event(), self.binding, "41",
+                        lambda _: self.fail("ambiguous reply was reposted"), find)
+            self.assertEqual(build.return_value.open.call_count, 1)
+
+    def test_publish_checks_identity_open_pr_and_bound_repository_before_post(self):
+        target = {"state": "open", "number": 2, "base": {"repo": {"id": 50, "full_name": REPOSITORY}}}
+        for owner, metadata in ((99, target), (42, {**target, "state": "closed"}),
+                                (42, {**target, "number": 3}),
+                                (42, {**target, "base": {"repo": {"id": 51, "full_name": REPOSITORY}}})):
+            with self.subTest(owner=owner, metadata=metadata), patch(
+                "orchestrator.auto_events.urllib.request.build_opener",
+            ) as build:
+                opener = build.return_value
+                opener.open.side_effect = [io.BytesIO(json.dumps(value).encode())
+                                           for value in [{"id": owner}, metadata]]
+                publish, _ = github_publisher(self.binding, "fixture")
+                with self.assertRaisesRegex(ReplyUnconfirmed, "BLOCKED/UNCONFIRMED"):
+                    publish("synthetic")
+                self.assertTrue(all(call.args[0].get_method() == "GET" for call in opener.open.call_args_list))
+        with patch("orchestrator.auto_events.urllib.request.build_opener") as build:
+            opener = build.return_value
+            opener.open.side_effect = [io.BytesIO(json.dumps(value).encode()) for value in
+                                       [{"id": 42}, target, {"id": 7, "user": {"id": 42}}]]
+            publish, _ = github_publisher(self.binding, "fixture")
+            self.assertEqual(publish("synthetic"), 7)
+            self.assertEqual([call.args[0].get_method() for call in opener.open.call_args_list],
+                             ["GET", "GET", "POST"])
