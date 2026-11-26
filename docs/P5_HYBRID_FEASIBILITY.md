@@ -18,6 +18,11 @@
 
 ## 原生无 Secrets Mock
 
-`p5-hybrid-source-mock.yml` 默认关闭。未来仅在作者另批时，对隔离 PR 启用，作者提交固定 `P5-HYBRID-SOURCE-MOCK` 触发。只用 GitHub 自带的 `contents: read` token 读取公开 PR 和评论，无仓库或环境 Secrets、评论写入、远端台账或模型。只读探针核对精确 native event，输出摘要；同一 CI job 再运行用临时签名密钥和两个本地 Git 仓库构造的签名快照传递、替换负例及故障用例。真实 GitHub GET 路径尚未在云端跑，若返回 403 或源不匹配则失败，不增加权限。 [事件参考](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows)
+`p5-hybrid-source-mock.yml` 默认关闭。未来仅在作者另批时，对隔离 PR 启用，作者提交固定 `P5-HYBRID-SOURCE-MOCK` 触发。只用 GitHub 自带的 `contents: read` token 读取公开 PR 和评论，无仓库或环境 Secrets、评论写入、远端台账或模型。该工作流包含两个独立的验证步骤：
+
+- **原生事件 GET 探针**读取当前 GitHub 事件，再用只读 token 核对公开 PR 和原评论，输出来源摘要。当前仅通过本地 HTTP Mock 验证两次 GET 及其目标。真实 GitHub GET 尚未运行；若返回 403 或源不匹配，作业失败。
+- **本地签名快照测试**使用独立合成夹具、临时签名密钥和两个本地 Git 仓库，验证签名封套跨进程传递、替换拒绝及故障路径。它不签署 GET 探针收到的真实原生事件。工作流没有把原生事件封套传给第二个作业，本轮未验证从真实 GitHub 事件到签名授权的端到端链路。
+
+[事件参考](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows)
 
 验收命令为 `python3.12 -B -m unittest discover -s tests -v`。本地 Mock 已验证签名替换、不同 run/attempt、同一授权重放、并发、公私各一次拒绝、确认丢失、进程退出和私有回退。测试不接触真实远端台账。

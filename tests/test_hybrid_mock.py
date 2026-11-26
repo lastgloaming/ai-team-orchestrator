@@ -14,7 +14,7 @@ import unittest
 from contextlib import closing, redirect_stdout
 from dataclasses import asdict, replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from orchestrator.auto_events import AUTHOR_ACCOUNT, REPOSITORY
 from orchestrator.hybrid_mock import REF, LocalWitness, WitnessBinding, schedule_hybrid_mock
@@ -27,6 +27,8 @@ from test_live_scheduling import BILLING, CODE, authorization, event, response
 
 class HybridTests(unittest.TestCase):
     def setUp(self):
+        self.forbidden_transport = Mock(return_value=response())
+        self.addCleanup(self.forbidden_transport.assert_not_called)
         temp = tempfile.TemporaryDirectory(prefix="p5-hybrid-")
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
@@ -67,8 +69,6 @@ class HybridTests(unittest.TestCase):
                                     self.key_pin, event(self.approval), str(AUTHOR_ACCOUNT), CODE,
                                     run_id, run_attempt, mock)
 
-    def fail_if_called(self, *_):
-        self.fail("Mock transport was invoked")
 
     def test_public_content_is_only_commitment_and_private_precedes_model(self):
         def model(*_):
@@ -85,15 +85,15 @@ class HybridTests(unittest.TestCase):
 
         self.assertEqual(self.run_mock(model)["model_call"], "SUCCEEDED")
         with self.assertRaises(StateConflict):
-            self.run_mock(self.fail_if_called)
+            self.run_mock(self.forbidden_transport)
         for ref, anchor in zip(REFS, self.anchors, strict=True):
             self.git("-C", str(self.private), "update-ref", ref, anchor)
         with self.assertRaisesRegex(StateConflict, "witness consumed"):
-            self.run_mock(self.fail_if_called)
+            self.run_mock(self.forbidden_transport)
         replacement = self.seal(replace(self.approval, approval="c" * 32),
                                 replace(self.binding, commitment=secrets.token_hex(32)))
         with self.assertRaisesRegex(StateConflict, "witness consumed"):
-            self.run_mock(self.fail_if_called, envelope=replacement)
+            self.run_mock(self.forbidden_transport, envelope=replacement)
 
     def test_concurrent_runners_have_only_one_witness_grant(self):
         barrier = threading.Barrier(2)
@@ -123,7 +123,7 @@ class HybridTests(unittest.TestCase):
         hook.write_text("#!/bin/sh\nexit 1\n")
         hook.chmod(0o700)
         with self.assertRaisesRegex(StateConflict, "not independently confirmed"):
-            self.run_mock(self.fail_if_called)
+            self.run_mock(self.forbidden_transport)
         self.assertEqual(self.witness().tip(self.public), self.binding.anchor)
         for ref, anchor in zip(REFS, self.anchors, strict=True):
             self.assertEqual(self.git("-C", str(self.private), "rev-parse", ref).decode().strip(), anchor)
@@ -132,10 +132,10 @@ class HybridTests(unittest.TestCase):
         hook = self.private / "hooks" / "update"
         hook.write_text("#!/bin/sh\nexit 1\n")
         hook.chmod(0o700)
-        self.assertEqual(self.run_mock(self.fail_if_called)["model_call"], "NOT_SENT")
+        self.assertEqual(self.run_mock(self.forbidden_transport)["model_call"], "NOT_SENT")
         self.assertNotEqual(self.witness().tip(self.public), self.binding.anchor)
         with self.assertRaisesRegex(StateConflict, "witness consumed"):
-            self.run_mock(self.fail_if_called)
+            self.run_mock(self.forbidden_transport)
 
     def test_lost_public_push_ack_keeps_slot_burned_without_model(self):
         class LostWitness(LocalWitness):
@@ -144,9 +144,9 @@ class HybridTests(unittest.TestCase):
                 raise StateConflict("injected loss after witness commit")
 
         with self.assertRaisesRegex(StateConflict, "injected loss"):
-            self.run_mock(self.fail_if_called, witness=self.witness(LostWitness))
+            self.run_mock(self.forbidden_transport, witness=self.witness(LostWitness))
         with self.assertRaisesRegex(StateConflict, "witness consumed"):
-            self.run_mock(self.fail_if_called)
+            self.run_mock(self.forbidden_transport)
 
     def test_process_exit_after_public_commit_prevents_future_send(self):
         program = """
@@ -161,18 +161,18 @@ os._exit(27)
                                env={**os.environ, "TMPDIR": str(self.root)}, timeout=20)
         self.assertEqual(child.returncode, 27)
         with self.assertRaisesRegex(StateConflict, "witness consumed"):
-            self.run_mock(self.fail_if_called)
+            self.run_mock(self.forbidden_transport)
 
     def test_run_attempt_and_signed_snapshot_replacement_refused(self):
         for args in ({"run_id": 501}, {"run_attempt": 2}):
             with self.assertRaisesRegex(ValueError, "first run"):
-                self.run_mock(self.fail_if_called, **args)
+                self.run_mock(self.forbidden_transport, **args)
         encoded = json.loads(self.envelope)
         payload = json.loads(base64.b64decode(encoded["payload"]))
         payload["witness"]["commitment"] = "0" * 64
         encoded["payload"] = base64.b64encode(canonical(payload)).decode()
         with self.assertRaisesRegex(ValueError, "signature"):
-            self.run_mock(self.fail_if_called, envelope=json.dumps(encoded))
+            self.run_mock(self.forbidden_transport, envelope=json.dumps(encoded))
         self.assertEqual(self.witness().tip(self.public), self.binding.anchor)
 
     def test_native_mock_source_uses_only_two_readonly_gets(self):
@@ -184,7 +184,11 @@ os._exit(27)
             http = opener.return_value.open
             http.side_effect = [io.BytesIO(json.dumps(row).encode()) for row in (pr, comment)]
             probe(payload, str(AUTHOR_ACCOUNT), 2, 500, CODE, "fixture-token")
-            self.assertEqual([call.args[0].get_method() for call in http.call_args_list], ["GET", "GET"])
+            self.assertEqual([(call.args[0].get_method(), call.args[0].full_url)
+                              for call in http.call_args_list], [
+                ("GET", f"https://api.github.com/repos/{REPOSITORY}/pulls/2"),
+                ("GET", f"https://api.github.com/repos/{REPOSITORY}/issues/comments/101"),
+            ])
             self.assertEqual(json.loads(out.getvalue())["source_get"], "PASS")
 
     def test_private_rollback_between_reservation_and_transport_refuses_mock(self):
@@ -198,10 +202,12 @@ os._exit(27)
                         test.git("-C", str(test.private), "update-ref", ref, anchor)
                 return result
 
-        result = self.run_mock(self.fail_if_called, state=self.state(RollbackAfterReserve))
+        transport = Mock(return_value=response())
+        result = self.run_mock(transport, state=self.state(RollbackAfterReserve))
         self.assertEqual(result["model_call"], "UNCONFIRMED")
+        transport.assert_not_called()
         with self.assertRaisesRegex(StateConflict, "witness consumed"):
-            self.run_mock(self.fail_if_called)
+            self.run_mock(self.forbidden_transport)
 
     def test_canonical_envelope_transfers_across_process_boundary(self):
         envelope_file = self.root / "envelope.json"
@@ -224,4 +230,4 @@ assert receipt["model_call"] == "SUCCEEDED"
                                env={**os.environ, "PYTHONPATH": str(Path(__file__).parent)}, timeout=20)
         self.assertEqual(child.returncode, 0)
         with self.assertRaises(StateConflict):
-            self.run_mock(self.fail_if_called)
+            self.run_mock(self.forbidden_transport)
