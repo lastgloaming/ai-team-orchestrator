@@ -15,6 +15,11 @@ from .state import LIVE_REMOTE, StateConflict
 REPOSITORY = "lastgloaming/ai-team-orchestrator"
 COMMAND = "P4-SYNTHETIC-COMMAND"
 KINDS = ("ACK", "RESULT")
+SHARED_MODE = "shared-synthetic"
+INDEPENDENT_MODE = "independent"
+AUTHOR_ACCOUNT = 338499555
+ACTIONS_BOT_ID = 41898282
+ACTIONS_BOT_LOGIN = "github-actions[bot]"
 
 
 class ReplyUnconfirmed(RuntimeError):
@@ -35,11 +40,17 @@ class Binding:
     sender: int
     publisher: int
     shared: int
+    mode: str = INDEPENDENT_MODE
 
     def __post_init__(self):
-        if (not all(positive_id(value) for value in vars(self).values()) or self.pr <= 1
-                or len({self.sender, self.publisher, self.shared}) != 3):
-            raise ValueError("require an isolated PR and distinct authenticated identities")
+        identities = (self.sender, self.publisher, self.shared)
+        if not all(positive_id(value) for value in (self.repository_id, self.pr, *identities)) or self.pr <= 1:
+            raise ValueError("require an isolated PR and authenticated identities")
+        if self.mode == SHARED_MODE:
+            if identities != (AUTHOR_ACCOUNT, ACTIONS_BOT_ID, AUTHOR_ACCOUNT):
+                raise ValueError("shared synthetic mode requires the approved author and Actions bot")
+        elif self.mode != INDEPENDENT_MODE or len(set(identities)) != 3:
+            raise ValueError("independent mode requires distinct authenticated identities")
 
 
 def event_id(event, binding, actor):
@@ -104,7 +115,8 @@ def process(state, event, binding, actor, publish, find_reply=None):
     state.update(lambda ledger: _consume(ledger, identifier))
     for kind in KINDS:
         message_id = f"{identifier}:{kind}"
-        body = f"[ORCHESTRATOR SYNTHETIC {kind}]\n\nSynthetic test only. Reply ID: `{message_id}`."
+        context = (" Shared-account test with no AI attribution." if binding.mode == SHARED_MODE else "")
+        body = f"[ORCHESTRATOR SYNTHETIC {kind}]\n\nSynthetic test only.{context} Reply ID: `{message_id}`."
         try:
             claimed = state.update(lambda ledger: _claim(ledger, message_id))
             if not claimed and state.update(lambda ledger: _status(ledger, message_id)) == "sent":
@@ -142,11 +154,18 @@ def github_publisher(binding, token):
 
     comments = f"{base}/repos/{REPOSITORY}/issues/{binding.pr}/comments"
 
+    def is_publisher(user):
+        return (positive_id(user["id"]) and user["id"] == binding.publisher
+                and (binding.mode != SHARED_MODE or
+                     (user.get("login") == ACTIONS_BOT_LOGIN and user.get("type") == "Bot")))
+
     def send(body):
-        with opener.open(urllib.request.Request(f"{base}/user", headers=headers), timeout=10) as response:
-            owner = json.load(response)["id"]
-        if not positive_id(owner) or owner != binding.publisher:
-            raise ReplyUnconfirmed("reply credential identity does not match binding")
+        if binding.mode == INDEPENDENT_MODE:
+            with opener.open(urllib.request.Request(f"{base}/user", headers=headers), timeout=10) as response:
+                if not is_publisher(json.load(response)):
+                    raise ReplyUnconfirmed("reply credential identity does not match binding")
+        # The trusted workflow injects github.token in shared mode. Installation
+        # tokens cannot use GET /user, so confirm its bot author on the POST result.
         pr_url = f"{base}/repos/{REPOSITORY}/pulls/{binding.pr}"
         with opener.open(urllib.request.Request(pr_url, headers=headers), timeout=10) as response:
             target = json.load(response)
@@ -161,8 +180,7 @@ def github_publisher(binding, token):
         )
         with opener.open(request, timeout=10) as response:
             result = json.load(response)
-        author = result["user"]["id"]
-        if not positive_id(author) or author != binding.publisher:
+        if not is_publisher(result["user"]):
             raise RuntimeError("unexpected reply author")
         return result["id"]
 
@@ -173,8 +191,7 @@ def github_publisher(binding, token):
             with opener.open(request, timeout=10) as response:
                 entries = json.load(response)
             matches.extend(entry["id"] for entry in entries
-                           if positive_id(entry["user"]["id"]) and entry["user"]["id"] == binding.publisher
-                           and entry["body"] == body)
+                           if is_publisher(entry["user"]) and entry["body"] == body)
             if len(entries) < 100:
                 return matches[0] if len(matches) == 1 else None
         return None
@@ -188,18 +205,26 @@ def main():
             or os.environ.get("GITHUB_REPOSITORY") != REPOSITORY
             or os.environ.get("GITHUB_REF") != "refs/heads/main"):
         return
-    binding = Binding(*(int(os.environ[f"ORCHESTRATOR_AUTO_{key}"])
-                        for key in ("REPOSITORY_ID", "PR", "SENDER_ID", "PUBLISHER_ID", "SHARED_ID")))
+    mode = os.environ.get("ORCHESTRATOR_AUTO_IDENTITY_MODE") or INDEPENDENT_MODE
+    repository_id, pr = (int(os.environ[f"ORCHESTRATOR_AUTO_{key}"]) for key in ("REPOSITORY_ID", "PR"))
+    if mode == SHARED_MODE:
+        binding = Binding(repository_id, pr, AUTHOR_ACCOUNT, ACTIONS_BOT_ID, AUTHOR_ACCOUNT, mode)
+        reply_token = os.environ.get("GITHUB_TOKEN")
+    else:
+        identities = (int(os.environ[f"ORCHESTRATOR_AUTO_{key}"])
+                      for key in ("SENDER_ID", "PUBLISHER_ID", "SHARED_ID"))
+        binding = Binding(repository_id, pr, *identities, mode)
+        reply_token = os.environ.get("ORCHESTRATOR_AUTO_REPLY_TOKEN")
     with Path(os.environ["GITHUB_EVENT_PATH"]).open() as stream:
         event = json.load(stream)
     actor = os.environ.get("GITHUB_ACTOR_ID")
     if event_id(event, binding, actor) is None:
         return
-    if not os.environ.get("ORCHESTRATOR_STATE_TOKEN") or not os.environ.get("ORCHESTRATOR_AUTO_REPLY_TOKEN"):
+    if not os.environ.get("ORCHESTRATOR_STATE_TOKEN") or not reply_token:
         raise RuntimeError("existing isolated state and reply credentials are required")
     state = PairedState(LIVE_REMOTE, os.environ["ORCHESTRATOR_AUTO_ENVIRONMENT"],
                         (os.environ["ORCHESTRATOR_AUTO_STATE_ANCHOR"], os.environ["ORCHESTRATOR_AUTO_CHECKPOINT_ANCHOR"]))
-    send, find_reply = github_publisher(binding, os.environ["ORCHESTRATOR_AUTO_REPLY_TOKEN"])
+    send, find_reply = github_publisher(binding, reply_token)
     process(state, event, binding, actor, send, find_reply)
 
 
