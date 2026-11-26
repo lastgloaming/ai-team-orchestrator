@@ -83,6 +83,10 @@ This mode uses the existing schema-v2 state/checkpoint anchors. Configuration of
 
 ### P5 模拟调度联动
 
-合成事件提交并消费后，离线调用方可显式注入 `MockScheduler`。现有 GitHub 工作流不注入此调度器，也没有获得模型凭证。调度器在 schema v2 的配对快照中按需增加既有用量表及事件与模型预留的关联表，保留原有 inbox、绑定及回执。预算检查、一次性标记及预留必须一起成功提交。传输在 Git 事务之外，固定输入仅含合成状态；提交冲突只重放台账变更。
+现有 GitHub 工作流未接入调度器，也没有获得模型凭证。离线传输必须同时设置默认关闭的 `ORCHESTRATOR_MODEL_SCHEDULING_ENABLED=1`、注入 Mock 调度器并提交新的 `P5-SYNTHETIC-ADVICE` 合成事件。资格在首次入队时写入双分支台账。P4 历史事件和授权关闭时已收到的事件继续作为通信记录，重放不会补发模型资格。
 
-建议只持久化允许的枚举，无论模型返回什么都不生成命令或改变合成回复。预算耗尽为 BLOCKED；传输超时或无法核算为 UNCERTAIN；进程崩溃前留下的 RESERVED 需要人工核对。均不自动重试。模型可单独用 `ORCHESTRATOR_MODEL_STOP` 停止（兼容原模型停止变量 `ORCHESTRATOR_STOP`）；合成发布用 `ORCHESTRATOR_AUTO_COMMUNICATION_STOP` 停止。通信停止时仍允许持久接收，已发出的请求不能撤回。真实模型、账户用量及任何私有工作流均需另行审批和独立存储。
+通信成功与调度状态分别返回。合成 ACK/RESULT 仅表示通信完成。预算拒绝、并发拒绝和停止均按事件持久化原因，不生成虚假的用量或预留。拒绝和不确定结果不会因预算、时间或配置变更自动重新评估。如需另一次试验，须显式授权一个新合成事件。已提交的 RESERVED 表示未确认，进程故障保留预留，禁止自动重发。只持久化允许的建议枚举；建议不会生成命令或改变合成回复。
+
+预留和一次性标记原子提交后才调用 Mock。Git 重试只重放台账操作。调度器强制 CNY 峰值费率、每日及每月上限 2.20 元、输出最多 64、并发 1、零重试。配对快照中的台账明确用于合成会计，与真实 P4 用量隔离。独立历史校验拒绝删除关联、重写已结算用量以及从历史通信反向补发资格。原有 schema v2 通信快照可只读加载。
+
+`ORCHESTRATOR_MODEL_STOP`（兼容原模型停止变量 `ORCHESTRATOR_STOP`）与 `ORCHESTRATOR_AUTO_COMMUNICATION_STOP` 独立。真实模型调用及台账部署仍需另行批准。
