@@ -1,0 +1,38 @@
+name: Isolated synthetic comment events
+on:
+  issue_comment:
+    types: [created]
+permissions:
+  contents: read
+jobs:
+  synthetic:
+    if: >-
+      vars.ORCHESTRATOR_AUTO_SYNTHETIC_ENABLED == '1' &&
+      github.repository == 'lastgloaming/ai-team-orchestrator' &&
+      github.ref == 'refs/heads/main' &&
+      github.event.issue.pull_request != null &&
+      format('{0}', github.event.issue.number) == vars.ORCHESTRATOR_AUTO_PR &&
+      format('{0}', github.event.sender.id) == vars.ORCHESTRATOR_AUTO_SENDER_ID
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: p4-auto-synthetic
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - run: python -B -m orchestrator.auto_events
+        env:
+          ORCHESTRATOR_AUTO_SYNTHETIC_ENABLED: ${{ vars.ORCHESTRATOR_AUTO_SYNTHETIC_ENABLED }}
+          ORCHESTRATOR_AUTO_ENVIRONMENT: ${{ vars.ORCHESTRATOR_AUTO_ENVIRONMENT }}
+          ORCHESTRATOR_AUTO_REPOSITORY_ID: ${{ vars.ORCHESTRATOR_AUTO_REPOSITORY_ID }}
+          ORCHESTRATOR_AUTO_PR: ${{ vars.ORCHESTRATOR_AUTO_PR }}
+          ORCHESTRATOR_AUTO_SENDER_ID: ${{ vars.ORCHESTRATOR_AUTO_SENDER_ID }}
+          ORCHESTRATOR_AUTO_PUBLISHER_ID: ${{ vars.ORCHESTRATOR_AUTO_PUBLISHER_ID }}
+          ORCHESTRATOR_AUTO_SHARED_ID: ${{ vars.ORCHESTRATOR_AUTO_SHARED_ID }}
+          ORCHESTRATOR_AUTO_STATE_ANCHOR: ${{ vars.ORCHESTRATOR_AUTO_STATE_ANCHOR }}
+          ORCHESTRATOR_AUTO_CHECKPOINT_ANCHOR: ${{ vars.ORCHESTRATOR_AUTO_CHECKPOINT_ANCHOR }}
+          ORCHESTRATOR_STATE_TOKEN: ${{ secrets.ORCHESTRATOR_STATE_TOKEN }}
+          ORCHESTRATOR_AUTO_REPLY_TOKEN: ${{ secrets.ORCHESTRATOR_AUTO_REPLY_TOKEN }}
