@@ -1,0 +1,3 @@
+P4 synthetic event test target 001.
+Synthetic data only. This branch and PR are a test fixture. Do not merge.
+No real AI integration or model invocation.
