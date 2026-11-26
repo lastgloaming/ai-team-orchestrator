@@ -21,8 +21,8 @@ def enabled():
     return os.environ.get("ORCHESTRATOR_MODEL_SCHEDULING_ENABLED") == "1"
 
 
-class MockScheduler:
-    def __init__(self, state, limits, mock_transport):
+class Scheduler:
+    def __init__(self, state, limits, transport, *, gate, authorize=None):
         if (limits.currency != "CNY" or limits.retries != 0 or limits.concurrent != 1
                 or max(limits.daily_budget, limits.monthly_budget) > 2_200_000_000
                 or limits.daily_budget > limits.monthly_budget or limits.max_output > 64
@@ -30,7 +30,9 @@ class MockScheduler:
             raise ValueError("Mock scheduling requires CNY peak rates, bounded budget, concurrency 1 and no retries")
         self.state = state
         self.limits = limits
-        self.mock_transport = mock_transport
+        self.transport = transport
+        self.gate = gate
+        self.authorize = authorize
 
     @staticmethod
     def stopped():
@@ -38,14 +40,16 @@ class MockScheduler:
                 or os.environ.get("ORCHESTRATOR_STOP") == "1")
 
     def _advisor(self, path):
-        return Advisor(path, self.limits, self.mock_transport,
+        return Advisor(path, self.limits, self.transport,
                        stopped=self.stopped, ledger_transaction=model_transaction)
 
     def __call__(self, event_id):
-        if not enabled():
+        if not self.gate():
             return ModelOutcome(ModelStatus.DISABLED)
 
         def reserve(path):
+            if self.authorize is not None:
+                self.authorize(path)
             with transaction(path, schema="") as db:
                 has_eligibility = db.execute(
                     "SELECT 1 FROM sqlite_schema WHERE name='auto_model_eligibility' AND type='table'"
@@ -108,9 +112,14 @@ class MockScheduler:
 
         # Git conflict recovery replays only local SQLite mutations.
         response = None
-        if enabled() and not self.stopped():
+        if self.gate() and not self.stopped():
             try:
-                response = self.mock_transport(self._advisor(None).request("ACCEPTED"), 10)
+                response = self.transport(self._advisor(None).request("ACCEPTED"), 10)
             except Exception:
                 pass
         return self.state.update(lambda path: settle(path, response))
+
+
+class MockScheduler(Scheduler):
+    def __init__(self, state, limits, mock_transport):
+        super().__init__(state, limits, mock_transport, gate=enabled)

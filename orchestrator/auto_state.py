@@ -33,6 +33,11 @@ CREATE TABLE auto_outbox (
 
 
 class PairedState(GitState):
+    refs = REFS
+    schema = SCHEMA
+    inspect_snapshot = staticmethod(inspect_snapshot)
+    check_transition = staticmethod(check_transition)
+
     def __init__(self, remote, environment, anchors=None):
         super().__init__(remote)
         if not IDENTIFIER.fullmatch(environment):
@@ -44,9 +49,9 @@ class PairedState(GitState):
         self._floor = self.anchors
 
     def _tips(self, root):
-        response = self._git(root, "ls-remote", self.remote, *REFS).stdout.decode()
+        response = self._git(root, "ls-remote", self.remote, *self.refs).stdout.decode()
         entries = {ref: sha for sha, ref in (line.split() for line in response.splitlines())}
-        return tuple(entries.get(ref) for ref in REFS)
+        return tuple(entries.get(ref) for ref in self.refs)
 
     def _object(self, root, commit, name):
         return self._git(root, "show", f"{commit}:{name}").stdout
@@ -69,7 +74,7 @@ class PairedState(GitState):
     def _load(self, root, floor):
         # Fetch both references into an isolated Git directory and verify the pair before use.
         self._git(root, "fetch", "--quiet", "--no-tags", self.remote,
-                  *(f"{ref}:refs/local/{index}" for index, ref in enumerate(REFS)))
+                  *(f"{ref}:refs/local/{index}" for index, ref in enumerate(self.refs)))
         tips = tuple(self._git(root, "rev-parse", f"refs/local/{index}").stdout.decode().strip()
                      for index in range(2))
         if floor != self.anchors:
@@ -93,9 +98,9 @@ class PairedState(GitState):
                     raise StateConflict("state pair must have linear histories")
             previous = witness
             ledger.write_bytes(self._object(root, state, "ledger.sqlite"))
-            current_ledger = inspect_snapshot(ledger)
+            current_ledger = self.inspect_snapshot(ledger)
             if prior_ledger is not None:
-                check_transition(prior_ledger, current_ledger)
+                self.check_transition(prior_ledger, current_ledger)
             prior_ledger = current_ledger
         self._check_ledger(ledger)
         return tips, len(states) - 1
@@ -131,15 +136,15 @@ class PairedState(GitState):
             "#!/bin/sh\nset -eu\nseen_state=0\nseen_witness=0\n"
             "while read -r local_ref local_sha remote_ref remote_sha; do\n"
             " case \"$remote_ref\" in\n"
-            f"  {STATE}) test \"$remote_sha\" = {before[0] or '0' * 40}; seen_state=1 ;;\n"
-            f"  {WITNESS}) test \"$remote_sha\" = {before[1] or '0' * 40}; seen_witness=1 ;;\n"
+            f"  {self.refs[0]}) test \"$remote_sha\" = {before[0] or '0' * 40}; seen_state=1 ;;\n"
+            f"  {self.refs[1]}) test \"$remote_sha\" = {before[1] or '0' * 40}; seen_witness=1 ;;\n"
             "  *) exit 1 ;;\n esac\ndone\n"
             'test "$seen_state$seen_witness" = 11\n'
         )
         hook.chmod(0o700)
         return (state, witness), self._git(
             root, "-c", f"core.hooksPath={hook.parent}", "push", "--atomic", self.remote,
-            f"{state}:{STATE}", f"{witness}:{WITNESS}", check=False,
+            f"{state}:{self.refs[0]}", f"{witness}:{self.refs[1]}", check=False,
         )
 
     def bootstrap(self):
@@ -153,7 +158,7 @@ class PairedState(GitState):
             if before != (None, None):
                 raise StateConflict("isolated references already exist or partially exist")
             with closing(sqlite3.connect(root / "ledger.sqlite")) as db:
-                db.executescript(SCHEMA)
+                db.executescript(self.schema)
             anchors, result = self._advance(root, before, 0)
             if result.returncode or self._tips(root) != anchors:
                 raise StateConflict("bootstrap unconfirmed; inspect both refs independently")
@@ -174,12 +179,12 @@ class PairedState(GitState):
                     floor = self._floor = before
                     ledger = root / "ledger.sqlite"
                     snapshot = ledger.read_bytes()
-                    before_ledger = inspect_snapshot(ledger)
+                    before_ledger = self.inspect_snapshot(ledger)
                     answer = mutate(ledger)
                     if snapshot == ledger.read_bytes():
                         return answer
                     self._check_ledger(ledger)
-                    check_transition(before_ledger, inspect_snapshot(ledger))
+                    self.check_transition(before_ledger, self.inspect_snapshot(ledger))
                     proposed, result = self._advance(root, before, sequence + 1)
                     observed = self._tips(root)
                 except (sqlite3.DatabaseError, subprocess.SubprocessError, ValueError) as error:
