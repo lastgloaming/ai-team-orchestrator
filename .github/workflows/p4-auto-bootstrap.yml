@@ -1,0 +1,39 @@
+name: Initialize isolated P4 state pair
+on:
+  workflow_dispatch:
+    inputs:
+      expected_main:
+        description: Reviewed full main SHA for this one-time operation
+        required: true
+        type: string
+      confirm:
+        description: Author approved this one-time atomic bootstrap
+        default: false
+        type: boolean
+permissions:
+  contents: read
+jobs:
+  bootstrap:
+    if: >-
+      github.repository == 'lastgloaming/ai-team-orchestrator' &&
+      github.ref == 'refs/heads/main' &&
+      inputs.confirm &&
+      vars.ORCHESTRATOR_AUTO_BOOTSTRAP_APPROVED == '1' &&
+      (vars.ORCHESTRATOR_AUTO_SYNTHETIC_ENABLED == '' || vars.ORCHESTRATOR_AUTO_SYNTHETIC_ENABLED == '0')
+    environment: p4-verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - run: python -B -m orchestrator.auto_bootstrap
+        env:
+          ORCHESTRATOR_AUTO_EXPECTED_MAIN: ${{ inputs.expected_main }}
+          ORCHESTRATOR_AUTO_BOOTSTRAP_CONFIRMED: ${{ inputs.confirm }}
+          ORCHESTRATOR_AUTO_BOOTSTRAP_APPROVED: ${{ vars.ORCHESTRATOR_AUTO_BOOTSTRAP_APPROVED }}
+          ORCHESTRATOR_AUTO_SYNTHETIC_ENABLED: ${{ vars.ORCHESTRATOR_AUTO_SYNTHETIC_ENABLED }}
+          ORCHESTRATOR_STATE_TOKEN: ${{ secrets.ORCHESTRATOR_STATE_TOKEN }}
