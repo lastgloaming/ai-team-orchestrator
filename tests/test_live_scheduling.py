@@ -11,7 +11,7 @@ import unittest
 from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from orchestrator.auto_events import AUTHOR_ACCOUNT, REPOSITORY
 from orchestrator.auto_state import PairedState
@@ -51,6 +51,8 @@ def response(advice="inspect_status"):
 
 class LiveSchedulingTests(unittest.TestCase):
     def setUp(self):
+        self.forbidden_transport = Mock(return_value=response())
+        self.addCleanup(self.forbidden_transport.assert_not_called)
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.remote = str(Path(temp.name) / "billing.git")
@@ -67,8 +69,6 @@ class LiveSchedulingTests(unittest.TestCase):
         return schedule_event(state or self.state(), authorization, payload or event(authorization), actor,
                               limits, transport, scheduling=lambda: scheduling, live=lambda: live, token=token, code_sha=CODE)
 
-    def fail_if_called(self, *_):
-        self.fail("model transport was invoked")
 
     def rows(self, query):
         def read(path):
@@ -78,19 +78,19 @@ class LiveSchedulingTests(unittest.TestCase):
 
     def test_default_off_identity_wrong_pr_historical_markers_and_missing_credential(self):
         for scheduling, live in ((False, False), (False, True), (True, False)):
-            result = self.run_event(self.fail_if_called, scheduling=scheduling, live=live)
+            result = self.run_event(self.forbidden_transport, scheduling=scheduling, live=live)
             self.assertEqual(result["scheduling"], "DISABLED")
         incorrect_pr = event(self.approval)
         incorrect_pr["issue"]["number"] = 3
         for result in (
-            self.run_event(self.fail_if_called, actor="99"),
-            self.run_event(self.fail_if_called, payload=incorrect_pr),
-            self.run_event(self.fail_if_called, payload=event(self.approval, body="P4-SYNTHETIC-COMMAND")),
-            self.run_event(self.fail_if_called, payload=event(self.approval, body="P5-SYNTHETIC-ADVICE")),
+            self.run_event(self.forbidden_transport, actor="99"),
+            self.run_event(self.forbidden_transport, payload=incorrect_pr),
+            self.run_event(self.forbidden_transport, payload=event(self.approval, body="P4-SYNTHETIC-COMMAND")),
+            self.run_event(self.forbidden_transport, payload=event(self.approval, body="P5-SYNTHETIC-ADVICE")),
         ):
             self.assertEqual(result["scheduling"], "NOT_ELIGIBLE")
         with self.assertRaisesRegex(ValueError, "credential"):
-            self.run_event(self.fail_if_called, token="")
+            self.run_event(self.forbidden_transport, token="")
         self.assertEqual(self.rows("SELECT * FROM live_authorization"), [])
 
     def test_success_requires_committed_authorization_and_cannot_replay_or_reconfigure(self):
@@ -104,19 +104,19 @@ class LiveSchedulingTests(unittest.TestCase):
         result = self.run_event(transport)
         self.assertEqual((result["communication"], result["model_call"], result["scheduling"]),
                          ("ACCEPTED", "SUCCEEDED", "ADVISED"))
-        self.assertEqual(self.run_event(self.fail_if_called)["model_call"], "RECORDED_SUCCEEDED")
+        self.assertEqual(self.run_event(self.forbidden_transport)["model_call"], "RECORDED_SUCCEEDED")
         new = replace(self.approval, approval="b" * 32, event_id=102, pr=3)
-        self.assertEqual(self.run_event(self.fail_if_called, authorization=new)["scheduling"], "BLOCKED")
+        self.assertEqual(self.run_event(self.forbidden_transport, authorization=new)["scheduling"], "BLOCKED")
         self.assertEqual(self.rows("SELECT count(*) FROM usage"), [(1,)])
 
     def test_budget_denial_is_persisted_without_usage_and_is_not_reevaluated(self):
         low = replace(LIMITS, daily_budget=531_999)
         signed_low = authorization(self.anchors, low)
-        result = self.run_event(self.fail_if_called, limits=low, authorization=signed_low)
+        result = self.run_event(self.forbidden_transport, limits=low, authorization=signed_low)
         self.assertEqual((result["model_call"], result["scheduling"]), ("NOT_SENT", "BLOCKED"))
         self.assertEqual(self.rows("SELECT status,reason FROM auto_model_attempt"), [("BLOCKED", "budget_exhausted")])
         self.assertEqual(self.rows("SELECT count(*) FROM usage"), [(0,)])
-        self.assertEqual(self.run_event(self.fail_if_called, authorization=signed_low, limits=low)["scheduling"], "BLOCKED")
+        self.assertEqual(self.run_event(self.forbidden_transport, authorization=signed_low, limits=low)["scheduling"], "BLOCKED")
 
     def test_output_is_not_actionable(self):
         result = self.run_event(lambda *_: response("execute_anything"))
@@ -138,18 +138,18 @@ schedule_event(state,approved,event(approved),str(AUTHOR_ACCOUNT),
         child = subprocess.run([sys.executable, "-B", "-c", code, self.remote, *self.anchors],
                                env={**os.environ, "PYTHONPATH": str(Path(__file__).parent)}, timeout=20)
         self.assertEqual(child.returncode, 23)
-        self.assertEqual(self.run_event(self.fail_if_called)["model_call"], "UNCONFIRMED")
+        self.assertEqual(self.run_event(self.forbidden_transport)["model_call"], "UNCONFIRMED")
         self.assertEqual(self.rows("SELECT status FROM auto_model_attempt"), [("RESERVED",)])
 
     def test_rejected_atomic_commit_and_legacy_pair_never_call_model(self):
         hook = Path(self.remote) / "hooks" / "update"
         hook.write_text(f'#!/bin/sh\ntest "$1" != {REFS[1]}\n')
         hook.chmod(0o700)
-        result = self.run_event(self.fail_if_called)
+        result = self.run_event(self.forbidden_transport)
         self.assertEqual((result["model_call"], result["scheduling"]), ("NOT_SENT", "BLOCKED"))
         self.assertEqual(self.rows("SELECT * FROM live_authorization"), [])
         with self.assertRaisesRegex(ValueError, "private ledger"):
-            self.run_event(self.fail_if_called, state=PairedState(self.remote, "other", self.anchors))
+            self.run_event(self.forbidden_transport, state=PairedState(self.remote, "other", self.anchors))
 
     def test_privacy_check_refuses_source_and_public_repositories(self):
         with self.assertRaises(ValueError):
@@ -203,24 +203,24 @@ schedule_event(state,approved,event(approved),str(AUTHOR_ACCOUNT),
             raise TimeoutError()
 
         self.assertEqual(self.run_event(mock)["model_call"], "UNCONFIRMED")
-        self.assertEqual(self.run_event(self.fail_if_called)["model_call"], "UNCONFIRMED")
+        self.assertEqual(self.run_event(self.forbidden_transport)["model_call"], "UNCONFIRMED")
         self.assertEqual(self.rows("SELECT amount,state FROM usage"), [(532_000, "uncertain")])
 
     def test_modified_limits_main_request_and_ledger_are_refused_before_first_use(self):
         for limits in (replace(LIMITS, input_ceiling=9), replace(LIMITS, daily_budget=1_000_000),
                        replace(LIMITS, model="different"), replace(LIMITS, max_output=63)):
             with self.subTest(limits=limits), self.assertRaisesRegex(ValueError, "signed execution"):
-                self.run_event(self.fail_if_called, limits=limits)
+                self.run_event(self.forbidden_transport, limits=limits)
         altered = replace(self.approval, execution=replace(self.approval.execution, request_sha256="0" * 64))
         with self.assertRaisesRegex(ValueError, "signed execution"):
-            self.run_event(self.fail_if_called, authorization=altered)
+            self.run_event(self.forbidden_transport, authorization=altered)
         with self.assertRaisesRegex(ValueError, "signed execution"):
             schedule_event(self.state(), self.approval, event(self.approval), str(AUTHOR_ACCOUNT),
-                           LIMITS, self.fail_if_called, scheduling=lambda: True, live=lambda: True,
+                           LIMITS, self.forbidden_transport, scheduling=lambda: True, live=lambda: True,
                            token="fixture", code_sha="e" * 40)
         wrong = PrivateLedger(self.remote, self.anchors, ledger_repo=BILLING[0], ledger_id=91)
         with self.assertRaisesRegex(ValueError, "signed execution"):
-            self.run_event(self.fail_if_called, state=wrong)
+            self.run_event(self.forbidden_transport, state=wrong)
         other = self.remote + "-other"
         subprocess.run(["git", "init", "--bare", "--quiet", other], check=True)
         # A second valid empty ledger cannot inherit the original approval.
@@ -229,7 +229,7 @@ schedule_event(state,approved,event(approved),str(AUTHOR_ACCOUNT),
             wrong_anchors = PrivateLedger(other).bootstrap()
         wrong = PrivateLedger(other, wrong_anchors, ledger_repo=BILLING[0], ledger_id=BILLING[1])
         with self.assertRaisesRegex(ValueError, "signed execution"):
-            self.run_event(self.fail_if_called, state=wrong)
+            self.run_event(self.forbidden_transport, state=wrong)
         self.assertEqual(self.rows("SELECT count(*) FROM live_authorization"), [(0,)])
 
     def test_bootstrap_and_paid_paths_are_blocked_even_with_switches_enabled(self):

@@ -210,7 +210,7 @@ def checked_remote(repo, repository_id, token):
     return f"https://github.com/{repo}.git"
 
 
-def check_source(approved, token):
+def check_source(approved, token, *, marker=COMMAND):
     """A delayed or retried run must not rely only on the original issue payload."""
     if not token:
         raise ValueError("source metadata credential missing")
@@ -227,7 +227,7 @@ def check_source(approved, token):
                      timeout=10) as response:
         comment = json.load(response)
     if (comment["id"] != approved.event_id or comment["user"]["id"] != AUTHOR_ACCOUNT
-            or comment["issue_url"] != f"{base}/issues/{approved.pr}" or comment["body"] != COMMAND):
+            or comment["issue_url"] != f"{base}/issues/{approved.pr}" or comment["body"] != marker):
         raise ValueError("approved comment no longer matches")
 
 

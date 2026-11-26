@@ -9,7 +9,7 @@ import unittest
 from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from orchestrator.auto_events import Binding, COMMAND, REPOSITORY, SCHEDULING_COMMAND, ReplyUnconfirmed, _consume, _enqueue, process
 from orchestrator.auto_state import PairedState
@@ -31,6 +31,8 @@ def response(suggestion="inspect_status"):
 
 class MockSchedulingTests(unittest.TestCase):
     def setUp(self):
+        self.forbidden_transport = Mock(return_value=response())
+        self.addCleanup(self.forbidden_transport.assert_not_called)
         self.enterContext(patch.dict(os.environ, {"ORCHESTRATOR_MODEL_SCHEDULING_ENABLED": "1"}))
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -68,7 +70,7 @@ class MockSchedulingTests(unittest.TestCase):
         sent = []
         self.assertTrue(process(self.state(), self.event(100, COMMAND), BINDING, "41",
                                 lambda body: sent.append(body) or len(sent)))
-        scheduler = MockScheduler(self.state(), LIMITS, lambda *_: self.fail("historical event called model"))
+        scheduler = MockScheduler(self.state(), LIMITS, self.forbidden_transport)
         result = process(self.state(), self.event(100, COMMAND), BINDING, "41",
                          lambda _: self.fail("duplicate reply"), schedule=scheduler)
         self.assertTrue(result.communication_completed)
@@ -87,20 +89,20 @@ class MockSchedulingTests(unittest.TestCase):
         self.assertEqual(result.scheduling.status, ModelStatus.ADVISED)
         self.assertEqual(result.scheduling.suggestion, "inspect_status")
         self.assertEqual(self.rows(), [(101, "ADVISED", "inspect_status", 10_000, "CNY", "counted")])
-        self.assertEqual(MockScheduler(self.state(), LIMITS, lambda *_: self.fail("duplicate model"))(101).status,
+        self.assertEqual(MockScheduler(self.state(), LIMITS, self.forbidden_transport)(101).status,
                          ModelStatus.ADVISED)
 
     def test_budget_persists_across_clients_and_blocks_before_transport(self):
         for identifier in (101, 102):
             self.consume(identifier)
         self.assertEqual(MockScheduler(self.state(), LIMITS, lambda *_: response())(101).status, "ADVISED")
-        scheduler = MockScheduler(self.state(), LIMITS, lambda *_: self.fail("budget exceeded"))
+        scheduler = MockScheduler(self.state(), LIMITS, self.forbidden_transport)
         result = process(self.state(), self.event(102), BINDING, "41", lambda _: 7, schedule=scheduler)
         self.assertTrue(result.communication_completed)
         self.assertEqual((result.scheduling.status, result.scheduling.reason),
                          (ModelStatus.BLOCKED, "budget_exhausted"))
         raised_budget = replace(LIMITS, daily_budget=90_000)
-        again = MockScheduler(self.state(), raised_budget, lambda *_: self.fail("denial reevaluated"))(102)
+        again = MockScheduler(self.state(), raised_budget, self.forbidden_transport)(102)
         self.assertEqual(again, result.scheduling)
         self.assertEqual(len(self.rows()), 1)
 
@@ -159,7 +161,7 @@ MockScheduler(PairedState(sys.argv[1], "fixture", tuple(sys.argv[2:])), limits, 
         child = subprocess.run([sys.executable, "-B", "-c", program, self.remote, *self.anchors], timeout=20)
         self.assertEqual(child.returncode, 23)
         self.assertEqual(self.rows(), [(101, "RESERVED", None, 52_000, "CNY", "active")])
-        self.assertEqual(MockScheduler(self.state(), LIMITS, lambda *_: self.fail("crash retried"))(101).status,
+        self.assertEqual(MockScheduler(self.state(), LIMITS, self.forbidden_transport)(101).status,
                          "RESERVED")
 
     def test_uncertain_response_retains_budget_and_disables_retry(self):
@@ -179,7 +181,7 @@ MockScheduler(PairedState(sys.argv[1], "fixture", tuple(sys.argv[2:])), limits, 
     def test_stops_are_independent(self):
         published = []
         with patch.dict(os.environ, {"ORCHESTRATOR_MODEL_STOP": "1"}):
-            scheduler = MockScheduler(self.state(), LIMITS, lambda *_: self.fail("model stop failed"))
+            scheduler = MockScheduler(self.state(), LIMITS, self.forbidden_transport)
             result = process(self.state(), self.event(101), BINDING, "41",
                              lambda body: published.append(body) or len(published), schedule=scheduler)
             self.assertTrue(result.communication_completed)
@@ -194,7 +196,7 @@ MockScheduler(PairedState(sys.argv[1], "fixture", tuple(sys.argv[2:])), limits, 
 
     def test_requires_committed_consumed_event_and_zero_retries(self):
         self.state().update(lambda path: _enqueue(path, 101, BINDING))
-        self.assertEqual(MockScheduler(self.state(), LIMITS, lambda *_: self.fail("unconsumed event"))(101).status,
+        self.assertEqual(MockScheduler(self.state(), LIMITS, self.forbidden_transport)(101).status,
                          ModelStatus.NOT_ELIGIBLE)
         for invalid in ({"retries": 1}, {"currency": "USD"}, {"concurrent": 2},
                         {"monthly_budget": 2_200_000_001}, {"max_output": 65}):
@@ -233,10 +235,10 @@ MockScheduler(PairedState(sys.argv[1], "fixture", tuple(sys.argv[2:])), limits, 
         hook.write_text('#!/bin/sh\ntest "$1" != refs/heads/p4-auto-test-checkpoints\n')
         hook.chmod(0o700)
         with self.assertRaisesRegex(StateConflict, "not confirmed"):
-            MockScheduler(self.state(), LIMITS, lambda *_: self.fail("uncommitted reservation called model"))(101)
+            MockScheduler(self.state(), LIMITS, self.forbidden_transport)(101)
 
     def test_default_off_and_later_enable_cannot_retroactively_admit_event(self):
-        scheduler = MockScheduler(self.state(), LIMITS, lambda *_: self.fail("disabled event called model"))
+        scheduler = MockScheduler(self.state(), LIMITS, self.forbidden_transport)
         with patch.dict(os.environ, {"ORCHESTRATOR_MODEL_SCHEDULING_ENABLED": ""}):
             result = process(self.state(), self.event(101), BINDING, "41", lambda _: 7, schedule=scheduler)
             self.assertTrue(result.communication_completed)
@@ -270,4 +272,4 @@ MockScheduler(PairedState(sys.argv[1], "fixture", tuple(sys.argv[2:])), limits, 
             _, pushed = state._advance(root, tips, sequence + 1)
             self.assertEqual(pushed.returncode, 0)
         with self.assertRaisesRegex(StateConflict, "incomplete synthetic scheduling schema"):
-            MockScheduler(self.state(), LIMITS, lambda *_: self.fail("tampered history called model"))(101)
+            MockScheduler(self.state(), LIMITS, self.forbidden_transport)(101)
