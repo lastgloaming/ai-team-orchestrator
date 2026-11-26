@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS outbox_leases (
 CREATE TABLE IF NOT EXISTS usage (
   id INTEGER PRIMARY KEY, day TEXT NOT NULL, model TEXT NOT NULL,
   amount INTEGER NOT NULL, state TEXT NOT NULL,
-  input_tokens INTEGER, output_tokens INTEGER, attempts INTEGER NOT NULL DEFAULT 0
+  input_tokens INTEGER, output_tokens INTEGER, attempts INTEGER NOT NULL DEFAULT 0,
+  currency TEXT NOT NULL DEFAULT 'USD' CHECK(currency IN ('USD', 'CNY'))
 );
 """
 

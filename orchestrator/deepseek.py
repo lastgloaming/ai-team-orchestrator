@@ -51,7 +51,7 @@ def live_transport(request, timeout):
 @dataclass(frozen=True)
 class Limits:
     model: str
-    input_rate: int  # integer nanodollars per token, rounded up
+    input_rate: int  # integer nano-units of currency per token, rounded up
     output_rate: int
     input_ceiling: int
     max_output: int
@@ -61,11 +61,15 @@ class Limits:
     monthly_calls: int
     concurrent: int = 1
     retries: int = 1
+    currency: str = "USD"
 
     def __post_init__(self):
         for name, value in vars(self).items():
             if name == "model":
                 if not isinstance(value, str) or not value.strip():
+                    raise ValueError(name)
+            elif name == "currency":
+                if value not in ("USD", "CNY"):
                     raise ValueError(name)
             elif type(value) is not int or not (0 if name == "retries" else 1) <= value <= 10**12:
                 raise ValueError(name)
@@ -85,6 +89,15 @@ class Advisor:
         self.pause = pause
         self.now = now
 
+    def _require_currency(self, db):
+        # Schema v1 model rows were exclusively denominated in USD.
+        if "currency" not in {column[1] for column in db.execute("PRAGMA table_info(usage)")}:
+            db.execute("ALTER TABLE usage ADD COLUMN currency TEXT NOT NULL DEFAULT 'USD' "
+                       "CHECK(currency IN ('USD', 'CNY'))")
+        if db.execute("SELECT 1 FROM usage WHERE currency IS NOT ? LIMIT 1",
+                      (self.limits.currency,)).fetchone():
+            raise BudgetExceeded("billing currency does not match existing usage ledger")
+
     def _reserve(self):
         limits = self.limits
         amount = limits.input_ceiling * limits.input_rate + limits.max_output * limits.output_rate
@@ -95,6 +108,7 @@ class Advisor:
             day = clock.astimezone(UTC).date().isoformat()
             if self.stopped() or os.environ.get("ORCHESTRATOR_STOP") == "1":
                 raise BudgetExceeded("emergency stop")
+            self._require_currency(db)
             if db.execute("SELECT 1 FROM usage WHERE state='overrun' LIMIT 1").fetchone():
                 raise BudgetExceeded("usage requires reconciliation")
             active = db.execute("SELECT count(*) FROM usage WHERE state='active'").fetchone()[0]
@@ -111,13 +125,14 @@ class Advisor:
                 if used + amount > budget or count >= calls:
                     raise BudgetExceeded("period budget or call limit")
             return db.execute(
-                "INSERT INTO usage (day,model,amount,state,attempts) VALUES (?,?,?,'active',1)",
-                (day, limits.model, amount),
+                "INSERT INTO usage (day,model,amount,state,attempts,currency) VALUES (?,?,?,'active',1,?)",
+                (day, limits.model, amount, limits.currency),
             ).lastrowid
 
     def reconcile_terminated_attempt(self, reservation):
         """Release the slot after an operator has verified the worker terminated."""
         with transaction(self.path) as db:
+            self._require_currency(db)
             return bool(db.execute(
                 "UPDATE usage SET state='uncertain' WHERE id=? AND state='active'",
                 (reservation,),
@@ -154,9 +169,7 @@ class Advisor:
                 raise InvalidResponse("malformed model response") from None
             finally:
                 # An ambiguous attempt keeps its full reserved amount.
-                with transaction(self.path) as db:
-                    db.execute("UPDATE usage SET state='uncertain' WHERE id=? AND state='active'",
-                               (reservation,))
+                self.reconcile_terminated_attempt(reservation)
             self.pause(min(2**attempt, 8))
 
     def _account_and_validate(self, reservation, data):
@@ -167,10 +180,12 @@ class Advisor:
                 not 0 <= outgoing <= self.limits.max_output):
             # Stop subsequent calls pending operator reconciliation.
             with transaction(self.path) as db:
-                db.execute("UPDATE usage SET state='overrun' WHERE id=?", (reservation,))
+                self._require_currency(db)
+                db.execute("UPDATE usage SET state='overrun' WHERE id=? AND state='active'", (reservation,))
             raise InvalidResponse("usage outside reserved ceiling")
         amount = incoming * self.limits.input_rate + outgoing * self.limits.output_rate
         with transaction(self.path) as db:
+            self._require_currency(db)
             settled = db.execute("""
                 UPDATE usage SET amount=?,state='counted',input_tokens=?,output_tokens=?
                 WHERE id=? AND state='active'
