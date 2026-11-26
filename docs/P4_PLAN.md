@@ -50,8 +50,17 @@ ORCH-REV-20261126-001 提供了 2026-11-26 官方只读资料核对结果。本�
 
 ## P4 实现及授权步骤
 
-- `p4-state` 由首次获批写入创建，根提交只包含 SQLite 台账。每次提交以读取版本为父提交，预推送检查核对远端公告的旧版本，Git 服务端再比较更新前的引用。冲突时重新下载台账并重放纯状态操作，最多四次。发送方须在提交成功后才确认事件已接收。同一 ID 与同一数据重复提交为幂等，不同数据被拒绝。调用方中断在提交前必须使用相同 ID 重试。状态分支历史应保留，不要删除或重置，否则已消费事件及一次性预算记录会丢失。
-- 独立工作流 `P4 gated verification` 仅支持可信 `main` 上的手动触发，当前 Draft 分支上的代码不会开启该入口。默认关闭。须由作者批准开启状态变量 `ORCHESTRATOR_P4_STATE_APPROVED` 及使用已有的独立仓库状态写入凭证 `ORCHESTRATOR_STATE_TOKEN`。工作流自己的 GitHub token 保持只读。先以 `enqueue-probe` 持久化一个合成事件，再从另一次运行触发 `prepare-probe` 取得相同 ID 的合成握手，重复入队验证去重。断在消费提交前的事件应在下一次运行可取。这个入口仅实现合成探针的入队，服务端自动收件及可信 webhook 中继仍待单独批准与实现。
+- `p4-state` 只能由单独获批的 `initialize-state` 创建，根提交只包含 SQLite 台账。正常运行要求作者提供最后确认的完整状态 SHA。远端缺失、初始 SHA 不匹配、并发路径非已确认版本的后继或台账损坏时停止。每次提交以读取版本为父提交，预推送检查核对远端公告的旧版本，Git 服务端再比较更新前的引用。冲突时重新下载台账并重放纯状态操作，最多四次。发送方须在提交成功后才确认事件已接收。同一 ID 与同一数据重复提交为幂等，不同数据被拒绝。调用方中断在提交前必须使用相同 ID 重试。状态分支历史应保留，不要删除或重置，否则已消费事件及一次性预算记录会丢失。
+- 独立工作流 `P4 gated verification` 仅支持可信 `main` 上的手动触发，当前 Draft 分支上的代码不会开启该入口。默认关闭。须由作者批准开启状态变量 `ORCHESTRATOR_P4_STATE_APPROVED` 及使用已有的独立仓库状态写入凭证 `ORCHESTRATOR_STATE_TOKEN`。工作流自己的 GitHub token 保持只读。待审批并按下节初始化后，以 `enqueue-probe` 持久化一个合成事件，再从另一次运行触发 `prepare-probe` 取得相同 ID 的合成握手，重复入队验证去重。断在消费提交前的事件应在下一次运行可取。这个入口仅实现合成探针的入队，服务端自动收件及可信 webhook 中继仍待单独批准与实现。
 - `deepseek-once` 另需 `ORCHESTRATOR_LIVE_APPROVED=1`、Actions Secret `DEEPSEEK_API_KEY`、作者批准的 `ORCHESTRATOR_P4_BUDGET_NANODOLLARS` 和已独立验证的 `ORCHESTRATOR_P4_INPUT_TOKEN_BOUND`。固定 Flash、关闭思考、输出最多 64 token、零重试。请求前先远程提交一次性标记和预留。请求、远端确认或账本结算不明确时不得清除标记重发。按 usage 和账单人工验收，保留日志中的结果状态和台账 SHA。
-- `send-probe` 另需 `ORCHESTRATOR_P4_PROBE_APPROVED=1`、经批准的独立仓库测试 PR 编号 `ORCHESTRATOR_P4_TEST_PR` 和已有评论发送凭证 `ORCHESTRATOR_PROBE_TOKEN`。先确认 Integration 已注册该隔离入口且有独立可认证身份。发件前先提交一次性领取记录，发送至独立仓库测试 PR。若超时，通过任务 ID 查找评论及回执，禁止自动重发或改 ID 绕过。记录发送评论 ID、ACK/RESULT 评论 ID 与可验证的 GitHub 主体，分别核对两个发送者均为预期独立 ID，并排除共享账号。用 `verify_probe` 校验同一任务 ID 和两种状态。缺少独立身份、超时、只有转发或没有两条回执时，保持未验收。
+- `send-probe` 另需 `ORCHESTRATOR_P4_PROBE_APPROVED=1`、经批准的独立仓库测试 PR 编号 `ORCHESTRATOR_P4_TEST_PR` 和已有评论发送凭证 `ORCHESTRATOR_PROBE_TOKEN`。先确认 Integration 已注册该隔离入口且有独立可认证身份。发件前先提交一次性领取记录，发送至独立仓库测试 PR。若超时，通过任务 ID 查找评论及回执，禁止自动重发或改 ID 绕过。记录发送评论 ID、ACK/RESULT 评论 ID 与可验证的 GitHub 主体，入队时把测试 PR 和独立身份绑定入台账。发送时配置必须与绑定一致。分别从受信任入口核对两条回执的仓库、PR 编号和独立数字 ID。用 `verify_probe` 校验匹配绑定的两条来源和任务状态。共享账号、评论正文 from 字段及转发声明均不能替代认证。缺少独立身份、超时、只有转发或没有两条回执时，保持未验收。
 - 本轮仅使用本地裸 Git 仓库和 Mock HTTP。真实状态分支创建、跨工作流测试、付费调用及外部 Bot 触发均须单独批准。
+
+
+### 可信 main 启用清单（均待作者授权）
+
+1. 确认经审核的工作流代码位于独立仓库受保护的默认分支 `main`，要求 PR 审核并限制直接写入。为 `p4-verification` 配置允许 `main` 的部署分支规则及可用的审批人限制。若当前 GitHub 套餐无法强制这些规则，先保持停用。工作流自身的 `GITHUB_TOKEN` 仅 `contents: read`，不保留 checkout 凭证。
+2. 为 `p4-state` 配置禁止删除及强推的规则，无绕过。仅允许受权状态写入身份正常快进，不给它修改 `main` 或写入 AI Writer 的权限。状态凭证使用作者批准的既有、短时、仅限独立仓库的 Contents 写入身份，通过环境 Secret `ORCHESTRATOR_STATE_TOKEN` 提供。将该凭证与 DeepSeek 及评论凭证分开。探针凭证只需读取指定 PR 及发评论，放在该环境的 `ORCHESTRATOR_PROBE_TOKEN`。不要借助全仓库默认写权限或可写源仓库的令牌。
+3. 在状态分支从未初始化且无可信 checkpoint 时，单独审批一次 bootstrap。在独立仓库临时设置 `ORCHESTRATOR_P4_STATE_APPROVED=1` 和 `ORCHESTRATOR_P4_BOOTSTRAP_APPROVED=1`，在 `main` 手动触发 `initialize-state`，checkpoint 输入留空。用独立读路径核对返回 SHA，保存到状态分支之外由作者控制的记录，然后关闭 bootstrap 变量。初始化存在冲突或确认不明时先核验远端和历史，禁止重新初始化。
+4. 以后每次手动运行由操作者提供外部记录中的最新完整 SHA。按工作流日志与独立 Git 读路径核对新 SHA 后再更新外部记录。并发运算只接受从已知版本快进的后继。人工记录落后时，先审查完整后继链和运行记录，再更新 checkpoint；不要用当前远程 SHA 自动覆盖可信记录。否则无法识别回退到仍然可读的旧台账。状态丢失、回退或损坏后停止，保留证据，由作者核对最近已确认账本、预算与待确认副作用后决定恢复。
+5. 探针另行审批。配置隔离测试 PR 的 `ORCHESTRATOR_P4_TEST_PR`、通过可信注册独立确认的 `ORCHESTRATOR_P4_INTEGRATION_ACTOR` 和明确排除的 `ORCHESTRATOR_P4_SHARED_ACTOR`。两条回执的元数据从已有认证的 GitHub 读取渠道取得。运行期间改配置不会改变已入队绑定。付费开关和 DeepSeek 环境 Secret 只在费用另行审批后配置。

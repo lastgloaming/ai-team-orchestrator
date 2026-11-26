@@ -6,10 +6,14 @@ on:
         type: choice
         required: true
         options:
+          - initialize-state
           - enqueue-probe
           - prepare-probe
           - send-probe
           - deepseek-once
+      state_checkpoint:
+        description: Trusted latest p4-state SHA (empty only for authorized initialization)
+        type: string
       event_id:
         description: Stable synthetic probe ID for enqueue
         type: string
@@ -21,10 +25,14 @@ jobs:
       github.repository == 'lastgloaming/ai-team-orchestrator' &&
       github.ref == 'refs/heads/main' &&
       vars.ORCHESTRATOR_P4_STATE_APPROVED == '1' &&
+      (inputs.operation != 'initialize-state' || vars.ORCHESTRATOR_P4_BOOTSTRAP_APPROVED == '1') &&
       (inputs.operation != 'deepseek-once' || vars.ORCHESTRATOR_LIVE_APPROVED == '1') &&
       (inputs.operation != 'send-probe' || vars.ORCHESTRATOR_P4_PROBE_APPROVED == '1')
+    environment: p4-verification
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    env:
+      ORCHESTRATOR_P4_STATE_CHECKPOINT: ${{ inputs.state_checkpoint }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -32,9 +40,13 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.12'
-      - if: inputs.operation == 'enqueue-probe' || inputs.operation == 'prepare-probe'
+      - if: inputs.operation == 'initialize-state' || inputs.operation == 'enqueue-probe' || inputs.operation == 'prepare-probe'
         env:
           P4_OPERATION: ${{ inputs.operation }}
+          ORCHESTRATOR_P4_BOOTSTRAP_APPROVED: ${{ vars.ORCHESTRATOR_P4_BOOTSTRAP_APPROVED }}
+          ORCHESTRATOR_P4_TEST_PR: ${{ vars.ORCHESTRATOR_P4_TEST_PR }}
+          ORCHESTRATOR_P4_INTEGRATION_ACTOR: ${{ vars.ORCHESTRATOR_P4_INTEGRATION_ACTOR }}
+          ORCHESTRATOR_P4_SHARED_ACTOR: ${{ vars.ORCHESTRATOR_P4_SHARED_ACTOR }}
           P4_EVENT_ID: ${{ inputs.event_id }}
           ORCHESTRATOR_P4_STATE_APPROVED: ${{ vars.ORCHESTRATOR_P4_STATE_APPROVED }}
           ORCHESTRATOR_STATE_TOKEN: ${{ secrets.ORCHESTRATOR_STATE_TOKEN }}
@@ -46,6 +58,8 @@ jobs:
           ORCHESTRATOR_STATE_TOKEN: ${{ secrets.ORCHESTRATOR_STATE_TOKEN }}
           ORCHESTRATOR_P4_PROBE_APPROVED: ${{ vars.ORCHESTRATOR_P4_PROBE_APPROVED }}
           ORCHESTRATOR_P4_TEST_PR: ${{ vars.ORCHESTRATOR_P4_TEST_PR }}
+          ORCHESTRATOR_P4_INTEGRATION_ACTOR: ${{ vars.ORCHESTRATOR_P4_INTEGRATION_ACTOR }}
+          ORCHESTRATOR_P4_SHARED_ACTOR: ${{ vars.ORCHESTRATOR_P4_SHARED_ACTOR }}
           ORCHESTRATOR_PROBE_TOKEN: ${{ secrets.ORCHESTRATOR_PROBE_TOKEN }}
         run: python -B -m orchestrator.p4 send-probe "$P4_EVENT_ID"
       - if: inputs.operation == 'deepseek-once'

@@ -3,6 +3,7 @@
 import base64
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -12,6 +13,7 @@ from contextlib import closing
 from .core import IDENTIFIER, transaction
 
 STATE_REF = "refs/heads/p4-state"
+CHECKPOINT = re.compile(r"[0-9a-f]{40}")
 LIVE_REMOTE = "https://github.com/lastgloaming/ai-team-orchestrator.git"
 
 
@@ -20,8 +22,11 @@ class StateConflict(RuntimeError):
 
 
 class GitState:
-    def __init__(self, remote):
+    def __init__(self, remote, checkpoint=None):
+        if checkpoint is not None and not CHECKPOINT.fullmatch(checkpoint):
+            raise ValueError("invalid state checkpoint")
         self.remote = remote
+        self.checkpoint = checkpoint
 
     def _git(self, root, *args, check=True, data=None):
         env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
@@ -47,56 +52,108 @@ class GitState:
             raise RuntimeError("could not read state ref")
         return result.stdout.decode().split()[0]
 
+    def _push_snapshot(self, root, ledger, version):
+        blob = self._git(root, "hash-object", "-w", "--stdin", data=ledger.read_bytes()).stdout.strip()
+        tree = self._git(root, "mktree", data=b"100644 blob " + blob + b"\tledger.sqlite\n")
+        parent = ("-p", version) if version else ()
+        commit = self._git(
+            root, "-c", "user.name=Orchestrator P4", "-c", "user.email=orchestrator@users.noreply.github.com",
+            "commit-tree", tree.stdout.decode().strip(), *parent,
+            "-m", "Update P4 ledger", "-m", f"Transaction: {os.urandom(16).hex()}",
+        ).stdout.decode().strip()
+        hook = root / "p4-hooks" / "pre-push"
+        hook.parent.mkdir(exist_ok=True)
+        expected = version or "0" * 40
+        hook.write_text(
+            "#!/bin/sh\n"
+            "read -r local_ref local_sha remote_ref remote_sha || exit 1\n"
+            f'test "$remote_ref" = {STATE_REF} && test "$remote_sha" = {expected}\n'
+        )
+        hook.chmod(0o700)
+        try:
+            pushed = self._git(root, "-c", f"core.hooksPath={hook.parent}", "push",
+                               self.remote, f"{commit}:{STATE_REF}", check=False)
+        except subprocess.TimeoutExpired:
+            pushed = None
+        current = self._version(root)
+        if current == commit:
+            return commit, current
+        if current is None or current == version:
+            raise StateConflict("state push unconfirmed; no external action authorized")
+        if pushed is not None and not pushed.returncode:
+            # Verify the new tip descends from the just-pushed commit before replay.
+            current = self._require_descendant(root, commit)
+        return None, current
+
+    def _require_descendant(self, root, floor):
+        self._git(root, "fetch", "--quiet", self.remote, STATE_REF)
+        fetched = self._git(root, "rev-parse", "FETCH_HEAD").stdout.decode().strip()
+        ancestor = self._git(root, "merge-base", "--is-ancestor", floor, fetched, check=False)
+        if ancestor.returncode:
+            raise StateConflict("state branch rolled back or diverged")
+        return fetched
+
+    def initialize(self):
+        """Bootstrap an empty remote explicitly. Existing state is never replaced."""
+        if self.checkpoint is not None:
+            raise StateConflict("cannot initialize after a checkpoint is configured")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._git(root, "init", "--quiet", "--bare")
+            if self._version(root) is not None:
+                raise StateConflict("state branch already exists")
+            ledger = root / "ledger.sqlite"
+            with transaction(ledger) as db:
+                db.execute("PRAGMA user_version=1")
+                db.execute("CREATE TABLE inbox (id TEXT PRIMARY KEY, payload TEXT NOT NULL, result TEXT)")
+                db.execute("CREATE TABLE p4_call (once INTEGER PRIMARY KEY CHECK(once=1), usage_id INTEGER)")
+                db.execute("CREATE TABLE probe_sends (id TEXT PRIMARY KEY)")
+            commit, _ = self._push_snapshot(root, ledger, None)
+            if commit is None:
+                raise StateConflict("another initialization won; verify its checkpoint")
+            self.checkpoint = commit
+            return commit
+
     def update(self, mutate):
-        """Commit a pure local mutation; return its result after push confirmation."""
-        for _ in range(4):
-            with tempfile.TemporaryDirectory() as temp:
-                root = Path(temp)
-                self._git(root, "init", "--quiet", "--bare")
-                version = self._version(root)
+        """Apply a replayable mutation against the exact trusted starting checkpoint."""
+        if self.checkpoint is None:
+            raise StateConflict("trusted state checkpoint is required")
+        version = self.checkpoint
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._git(root, "init", "--quiet", "--bare")
+            current = self._version(root)
+            if current is None:
+                raise StateConflict("state branch missing")
+            if current != version:
+                raise StateConflict("state checkpoint mismatch; verify the remote history")
+            for _ in range(4):
+                version = self._require_descendant(root, version)
                 ledger = root / "ledger.sqlite"
-                if version is not None:
-                    self._git(root, "fetch", "--quiet", "--depth=1", self.remote, STATE_REF)
-                    fetched = self._git(root, "rev-parse", "FETCH_HEAD").stdout.decode().strip()
-                    if version != fetched:
-                        continue
-                    ledger.write_bytes(self._git(root, "show", f"{version}:ledger.sqlite").stdout)
+                try:
+                    before = self._git(root, "show", f"{version}:ledger.sqlite").stdout
+                    ledger.write_bytes(before)
                     with closing(sqlite3.connect(f"file:{ledger}?mode=ro", uri=True)) as db:
-                        if db.execute("PRAGMA integrity_check").fetchone() != ("ok",):
-                            raise RuntimeError("invalid state snapshot")
-                before = ledger.read_bytes() if version is not None else None
+                        tables = {name for (name,) in db.execute(
+                            "SELECT name FROM sqlite_schema WHERE type='table'"
+                        )}
+                        required = {"inbox", "p4_call", "probe_sends", "usage", "seen", "tasks",
+                                    "decisions", "outbox", "outbox_leases"}
+                        if (db.execute("PRAGMA integrity_check").fetchone() != ("ok",)
+                                or db.execute("PRAGMA user_version").fetchone() != (1,)
+                                or not required <= tables):
+                            raise StateConflict("invalid state snapshot")
+                except (sqlite3.DatabaseError, subprocess.CalledProcessError):
+                    raise StateConflict("invalid state snapshot") from None
                 answer = mutate(ledger)
-                snapshot = ledger.read_bytes()
-                if snapshot == before:
+                if ledger.read_bytes() == before:
+                    self.checkpoint = version
                     return answer
-                blob = self._git(root, "hash-object", "-w", "--stdin", data=snapshot).stdout.strip()
-                tree = self._git(root, "mktree", data=b"100644 blob " + blob + b"\tledger.sqlite\n")
-                parent = ("-p", version) if version else ()
-                commit = self._git(
-                    root, "-c", "user.name=Orchestrator P4", "-c", "user.email=orchestrator@users.noreply.github.com",
-                    "commit-tree", tree.stdout.decode().strip(), *parent,
-                    "-m", "Update P4 ledger", "-m", f"Transaction: {os.urandom(16).hex()}",
-                ).stdout.decode().strip()
-                hook = root / "hooks" / "pre-push"
-                expected = version or "0" * 40
-                hook.write_text(
-                    "#!/bin/sh\n"
-                    "read -r local_ref local_sha remote_ref remote_sha || exit 1\n"
-                    f'test "$remote_ref" = {STATE_REF} && test "$remote_sha" = {expected}\n'
-                )
-                hook.chmod(0o700)
-                pushed = self._git(root, "-c", f"core.hooksPath={hook.parent}", "push",
-                                   self.remote, f"{commit}:{STATE_REF}", check=False)
-                if not pushed.returncode:
+                commit, current = self._push_snapshot(root, ledger, version)
+                if commit is not None:
+                    self.checkpoint = commit
                     return answer
-                current = self._version(root)
-                if current == commit:
-                    return answer
-                if current == version or current is None:
-                    raise RuntimeError("state push failed; no external action authorized")
-                # A peer advanced the ref, or an earlier acceptance was superseded.
-                # Replay pure operations only. A replayed reservation cannot authorize a send.
-        raise StateConflict("state changed repeatedly; retry the same event ID")
+            raise StateConflict("state changed repeatedly; retry the same event ID")
 
 
 def enqueue(ledger, event_id, payload):
@@ -106,9 +163,6 @@ def enqueue(ledger, event_id, payload):
     if len(encoded.encode()) > 8192:
         raise ValueError("event too large")
     with transaction(ledger) as db:
-        db.execute("""CREATE TABLE IF NOT EXISTS inbox (
-            id TEXT PRIMARY KEY, payload TEXT NOT NULL, result TEXT
-        )""")
         existing = db.execute("SELECT payload FROM inbox WHERE id=?", (event_id,)).fetchone()
         if existing:
             if existing[0] != encoded:
@@ -121,9 +175,6 @@ def enqueue(ledger, event_id, payload):
 def consume(ledger, handler):
     """Record a deterministic handler's result atomically with consuming the event."""
     with transaction(ledger) as db:
-        db.execute("""CREATE TABLE IF NOT EXISTS inbox (
-            id TEXT PRIMARY KEY, payload TEXT NOT NULL, result TEXT
-        )""")
         row = db.execute("SELECT id,payload FROM inbox WHERE result IS NULL ORDER BY rowid LIMIT 1").fetchone()
         if row is None:
             return None

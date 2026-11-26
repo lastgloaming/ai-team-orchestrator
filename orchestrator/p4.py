@@ -19,18 +19,27 @@ def probe_command(event_id):
     )
 
 
+def probe_binding(pr_number, expected_actor, shared_actor):
+    if any(type(value) is not int or value <= 0 for value in (pr_number, expected_actor, shared_actor)):
+        raise ValueError("invalid Integration binding")
+    if pr_number <= 1 or expected_actor == shared_actor:
+        raise ValueError("require an isolated PR and an independent Integration identity")
+    return {"kind": "integration_probe", "pr": pr_number, "actor": expected_actor, "shared": shared_actor}
+
+
 def prepare_probe(event_id, payload):
-    if payload != {"kind": "integration_probe"}:
+    if payload != probe_binding(payload["pr"], payload["actor"], payload["shared"]):
         raise ValueError("unsupported P4 event")
-    return {"command": probe_command(event_id)}
+    return {"command": probe_command(event_id), "binding": payload}
 
 
-def verify_probe(event_id, ack, result, *, ack_actor, result_actor, expected_actor, shared_actor):
-    """Both actor IDs must come from independently authenticated ingress."""
-    actors = (ack_actor, result_actor, expected_actor, shared_actor)
-    if any(type(actor) is not int or actor <= 0 for actor in actors):
+def verify_probe(event_id, binding, ack, result, *, ack_origin, result_origin):
+    """Origins must be authenticated (repository, PR number, numeric actor ID) tuples."""
+    validated = probe_binding(binding["pr"], binding["actor"], binding["shared"])
+    if binding != validated:
         return False
-    if expected_actor == shared_actor or (ack_actor, result_actor) != (expected_actor, expected_actor):
+    origin = ("lastgloaming/ai-team-orchestrator", binding["pr"], binding["actor"])
+    if ack_origin != origin or result_origin != origin:
         return False
     for body, kind, status in ((ack, "ACK", "ACCEPTED"), (result, "RESULT", "DONE")):
         try:
@@ -42,32 +51,31 @@ def verify_probe(event_id, ack, result, *, ack_actor, result_actor, expected_act
     return True
 
 
-def send_probe(state, event_id, transport):
+def send_probe(state, event_id, binding, transport):
     if not IDENTIFIER.fullmatch(event_id):
         raise ValueError("invalid probe ID")
 
     def claim(path):
         with transaction(path) as db:
-            db.execute("CREATE TABLE IF NOT EXISTS probe_sends (id TEXT PRIMARY KEY)")
             ready = db.execute("SELECT result FROM inbox WHERE id=?", (event_id,)).fetchone()
-            if not ready or ready[0] is None or json.loads(ready[0]) != {"command": probe_command(event_id)}:
-                raise ValueError("probe must be prepared first")
+            if not ready or ready[0] is None or json.loads(ready[0]) != prepare_probe(event_id, binding):
+                raise ValueError("probe must be prepared for this PR and identity")
             return bool(db.execute("INSERT OR IGNORE INTO probe_sends VALUES (?)", (event_id,)).rowcount)
 
     if not state.update(claim):
         return "probe already claimed; no comment sent"
     try:
-        comment_id = transport(probe_command(event_id))
+        comment_id = transport(binding["pr"], probe_command(event_id))
     except Exception:
         raise RuntimeError("probe delivery unconfirmed; reconcile before further action") from None
     return f"probe comment ID: {comment_id}"
 
 
-def github_probe_transport(pr_number):
+def github_probe_transport():
     token = os.environ["ORCHESTRATOR_PROBE_TOKEN"]
     opener = urllib.request.build_opener(NoRedirect())
 
-    def send(command):
+    def send(pr_number, command):
         base = "https://api.github.com/repos/lastgloaming/ai-team-orchestrator"
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
                    "Content-Type": "application/json"}
@@ -90,7 +98,6 @@ def single_call(state, limits, transport):
 
     def reserve(path):
         with transaction(path) as db:
-            db.execute("CREATE TABLE IF NOT EXISTS p4_call (once INTEGER PRIMARY KEY CHECK(once=1), usage_id INTEGER)")
             if db.execute("SELECT 1 FROM p4_call").fetchone():
                 return None
         reservation = Advisor(path, limits, transport)._reserve()
@@ -124,19 +131,41 @@ def single_call(state, limits, transport):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("operation", choices=("enqueue-probe", "prepare-probe", "send-probe", "deepseek-once"))
+    parser.add_argument("operation", choices=("initialize-state", "enqueue-probe", "prepare-probe", "send-probe", "deepseek-once"))
     parser.add_argument("event_id", nargs="?")
     args = parser.parse_args()
     if os.environ.get("ORCHESTRATOR_P4_STATE_APPROVED") != "1":
         parser.error("P4 state writes are disabled")
     if not os.environ.get("ORCHESTRATOR_STATE_TOKEN"):
         parser.error("approved state credential is required")
-    state = GitState(LIVE_REMOTE)
+    checkpoint = os.environ.get("ORCHESTRATOR_P4_STATE_CHECKPOINT") or None
+    state = GitState(LIVE_REMOTE, checkpoint)
+    if args.operation == "initialize-state":
+        if os.environ.get("ORCHESTRATOR_P4_BOOTSTRAP_APPROVED") != "1" or checkpoint:
+            parser.error("state bootstrap is disabled or a checkpoint already exists")
+        print(f"state checkpoint: {state.initialize()}")
+        return
+    if not checkpoint:
+        parser.error("trusted state checkpoint is required")
+    try:
+        run(state, args, parser)
+    finally:
+        print(f"last confirmed state checkpoint: {state.checkpoint}")
+
+
+def configured_probe():
+    return probe_binding(int(os.environ["ORCHESTRATOR_P4_TEST_PR"]),
+                         int(os.environ["ORCHESTRATOR_P4_INTEGRATION_ACTOR"]),
+                         int(os.environ["ORCHESTRATOR_P4_SHARED_ACTOR"]))
+
+
+def run(state, args, parser):
 
     if args.operation == "enqueue-probe":
         if not args.event_id:
             parser.error("event_id is required")
-        added = state.update(lambda path: enqueue(path, args.event_id, {"kind": "integration_probe"}))
+        binding = configured_probe()
+        added = state.update(lambda path: enqueue(path, args.event_id, binding))
         print("event committed" if added else "event already committed")
     elif args.operation == "prepare-probe":
         print(state.update(lambda path: consume(path, prepare_probe)))
@@ -144,10 +173,7 @@ def main():
         if (os.environ.get("ORCHESTRATOR_P4_PROBE_APPROVED") != "1"
                 or not os.environ.get("ORCHESTRATOR_PROBE_TOKEN") or not args.event_id):
             parser.error("Integration probe is disabled or missing configuration")
-        pr_number = int(os.environ["ORCHESTRATOR_P4_TEST_PR"])
-        if pr_number <= 1:
-            parser.error("probe requires a separate test PR in the independent repository")
-        print(send_probe(state, args.event_id, github_probe_transport(pr_number)))
+        print(send_probe(state, args.event_id, configured_probe(), github_probe_transport()))
     else:
         if os.environ.get("ORCHESTRATOR_LIVE_APPROVED") != "1" or not os.environ.get("DEEPSEEK_API_KEY"):
             parser.error("live model request is disabled or missing credentials")
