@@ -12,6 +12,14 @@ ROLES = frozenset({"author", "chatgpt", "integration", "memory", "editor", "writ
 TARGETS = ROLES - {"chatgpt", "author"}
 SCOPES = {"coordination": {"integration", "memory", "editor"}, "status": TARGETS}
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}")
+USAGE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS usage (
+  id INTEGER PRIMARY KEY, day TEXT NOT NULL, model TEXT NOT NULL,
+  amount INTEGER NOT NULL, state TEXT NOT NULL,
+  input_tokens INTEGER, output_tokens INTEGER, attempts INTEGER NOT NULL DEFAULT 0,
+  currency TEXT NOT NULL DEFAULT 'USD' CHECK(currency IN ('USD', 'CNY'))
+);
+"""
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS seen (event_id INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS tasks (
@@ -24,20 +32,15 @@ CREATE TABLE IF NOT EXISTS outbox (id TEXT PRIMARY KEY, payload TEXT NOT NULL,
 CREATE TABLE IF NOT EXISTS outbox_leases (
   id TEXT PRIMARY KEY REFERENCES outbox(id), token TEXT NOT NULL, expires_at INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS usage (
-  id INTEGER PRIMARY KEY, day TEXT NOT NULL, model TEXT NOT NULL,
-  amount INTEGER NOT NULL, state TEXT NOT NULL,
-  input_tokens INTEGER, output_tokens INTEGER, attempts INTEGER NOT NULL DEFAULT 0,
-  currency TEXT NOT NULL DEFAULT 'USD' CHECK(currency IN ('USD', 'CNY'))
-);
+
 """
 
 
 @contextmanager
-def transaction(path):
+def transaction(path, *, schema=SCHEMA + USAGE_SCHEMA):
     with closing(sqlite3.connect(path, timeout=10)) as db, db:
         db.execute("PRAGMA foreign_keys = ON")
-        db.executescript(SCHEMA)
+        db.executescript(schema)
         db.execute("BEGIN IMMEDIATE")
         yield db
 

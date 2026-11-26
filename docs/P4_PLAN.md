@@ -80,3 +80,9 @@ The separate **Initialize isolated P4 state pair** workflow is manual and off by
 The optional `ORCHESTRATOR_AUTO_IDENTITY_MODE=shared-synthetic` accepts only the fixed synthetic marker on the configured isolated PR from the confirmed shared GitHub account (ID 338499555). This authenticates the GitHub account and does not attribute the request to any AI. Replies are explicitly synthetic and are published using the job's built-in GitHub Actions token, with `contents: read` and `pull-requests: write` only on that job. The separate independent job retains its existing token and distinct-identity checks. The built-in Actions bot is excluded as an inbound sender and recognized on reply receipts by its system login, numeric ID and type. The existing state credential is still used for atomic state and witness writes.
 
 This mode uses the existing schema-v2 state/checkpoint anchors. Configuration of a different mode after the first persisted binding is rejected; do not reset the ledger to switch identities. The enable flag remains off by default. Real Integration and model calls are outside this workflow.
+
+### P5 模拟调度联动
+
+合成事件提交并消费后，离线调用方可显式注入 `MockScheduler`。现有 GitHub 工作流不注入此调度器，也没有获得模型凭证。调度器在 schema v2 的配对快照中按需增加既有用量表及事件与模型预留的关联表，保留原有 inbox、绑定及回执。预算检查、一次性标记及预留必须一起成功提交。传输在 Git 事务之外，固定输入仅含合成状态；提交冲突只重放台账变更。
+
+建议只持久化允许的枚举，无论模型返回什么都不生成命令或改变合成回复。预算耗尽为 BLOCKED；传输超时或无法核算为 UNCERTAIN；进程崩溃前留下的 RESERVED 需要人工核对。均不自动重试。模型可单独用 `ORCHESTRATOR_MODEL_STOP` 停止（兼容原模型停止变量 `ORCHESTRATOR_STOP`）；合成发布用 `ORCHESTRATOR_AUTO_COMMUNICATION_STOP` 停止。通信停止时仍允许持久接收，已发出的请求不能撤回。真实模型、账户用量及任何私有工作流均需另行审批和独立存储。

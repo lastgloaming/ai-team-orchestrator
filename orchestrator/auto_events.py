@@ -107,13 +107,21 @@ def _settle(ledger, message_id, comment_id):
             raise RuntimeError("claimed synthetic reply missing or conflicting")
 
 
-def process(state, event, binding, actor, publish, find_reply=None):
+def _require_communication():
+    if os.environ.get("ORCHESTRATOR_AUTO_COMMUNICATION_STOP") == "1":
+        raise ReplyUnconfirmed("automatic communication stopped")
+
+
+def process(state, event, binding, actor, publish, find_reply=None, *, schedule=None):
     identifier = event_id(event, binding, actor)
     if identifier is None:
         return False
     state.update(lambda ledger: _enqueue(ledger, identifier, binding))
     state.update(lambda ledger: _consume(ledger, identifier))
+    if schedule is not None:
+        schedule(identifier)
     for kind in KINDS:
+        _require_communication()
         message_id = f"{identifier}:{kind}"
         context = (" Shared-account test with no AI attribution." if binding.mode == SHARED_MODE else "")
         body = f"[ORCHESTRATOR SYNTHETIC {kind}]\n\nSynthetic test only.{context} Reply ID: `{message_id}`."
@@ -124,6 +132,7 @@ def process(state, event, binding, actor, publish, find_reply=None):
         except StateConflict:
             raise ReplyUnconfirmed("synthetic reply claim or status could not be confirmed") from None
         try:
+            _require_communication()
             sent = publish(body) if claimed else (find_reply(body) if find_reply else None)
         except ReplyUnconfirmed:
             raise
@@ -174,6 +183,7 @@ def github_publisher(binding, token):
                 or repository["full_name"] != REPOSITORY or not positive_id(repository["id"])
                 or repository["id"] != binding.repository_id):
             raise ReplyUnconfirmed("target PR is closed or does not match binding")
+        _require_communication()
         request = urllib.request.Request(
             comments, headers=headers,
             data=json.dumps({"body": body}).encode(), method="POST",
