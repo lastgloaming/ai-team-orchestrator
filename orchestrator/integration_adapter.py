@@ -32,6 +32,10 @@ CREATE TABLE IF NOT EXISTS integration_delivery_floor (
     task_id TEXT PRIMARY KEY REFERENCES integration_tasks(id),
     comment_id INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS integration_publication_seen (
+    task_id TEXT NOT NULL REFERENCES integration_tasks(id), comment_id INTEGER NOT NULL,
+    PRIMARY KEY(task_id,comment_id)
+);
 CREATE TABLE IF NOT EXISTS integration_receipts (
     comment_id INTEGER PRIMARY KEY,
     task_id TEXT NOT NULL REFERENCES integration_tasks(id),
@@ -166,7 +170,7 @@ class IntegrationAdapter:
             cost = ROUTES[action][1]
             attempted = db.execute("""
                 SELECT COUNT(*) FROM integration_tasks
-                WHERE comment_id IS NOT NULL OR state IN ('SENDING','UNCONFIRMED')
+                WHERE comment_id IS NOT NULL OR state IN ('SENDING','UNCONFIRMED','AMBIGUOUS')
             """).fetchone()[0]
             if not isinstance(resources, Resources) or not resources.allows(attempted, cost):
                 return "BLOCKED"
@@ -177,7 +181,7 @@ class IntegrationAdapter:
             comment = publish(body)
             if not self._outbound_matches(comment, body, after_comment_id):
                 raise ValueError("send confirmation does not match control channel")
-            self._confirm(task_id, comment.id)
+            self._record_publications(task_id, [comment], direct=True)
         except Exception:
             with transaction(self.path, schema=SCHEMA) as db:
                 db.execute("UPDATE integration_tasks SET state='UNCONFIRMED' WHERE id=? AND state='SENDING'",
@@ -189,30 +193,37 @@ class IntegrationAdapter:
         return (isinstance(comment, Comment) and comment.scoped() and comment.actor_id == OWNER_ID
                 and comment.actor_login == OWNER_LOGIN and comment.id > floor and comment.body == body)
 
-    def _confirm(self, task_id, comment_id):
-        with transaction(self.path, schema=SCHEMA) as db:
-            changed = db.execute("""
-                UPDATE integration_tasks SET state='SENT',comment_id=?
-                WHERE id=? AND state IN ('SENDING','UNCONFIRMED')
-            """, (comment_id, task_id)).rowcount
-            if not changed and db.execute("SELECT comment_id FROM integration_tasks WHERE id=?",
-                                          (task_id,)).fetchone() != (comment_id,):
-                raise RuntimeError("conflicting outbound confirmation")
+    def reconcile_mock(self, task_id, comments, *, verified_complete=False):
+        """Only the trusted mock reader attests full pagination for this task's channel."""
+        return self._record_publications(task_id, comments, complete=verified_complete is True)
 
-    def reconcile_mock(self, task_id, comments):
-        """Caller supplies a complete, trusted observation. Absence never authorizes a resend."""
+    def _record_publications(self, task_id, comments, *, direct=False, complete=False):
         with transaction(self.path, schema=SCHEMA) as db:
             row = db.execute("""
-                SELECT action,target,ref,state,f.comment_id FROM integration_tasks t
-                JOIN integration_delivery_floor f ON f.task_id=t.id WHERE t.id=?
+                SELECT action,target,ref,state,f.comment_id,t.comment_id FROM integration_tasks t
+                LEFT JOIN integration_delivery_floor f ON f.task_id=t.id WHERE t.id=?
             """, (task_id,)).fetchone()
-        if row is None or row[3] not in {"UNCONFIRMED", "SENDING"}:
-            return self.status(task_id)
-        body = render(task_id, *row[:3])
-        matches = {comment.id for comment in comments if self._outbound_matches(comment, body, row[4])}
-        if len(matches) == 1:
-            self._confirm(task_id, matches.pop())
-        return self.status(task_id)
+            if not row or row[4] is None or row[3] == "AMBIGUOUS":
+                return row[3] if row else None
+            body = render(task_id, *row[:3])
+            matches = {c.id for c in comments if self._outbound_matches(c, body, row[4])}
+            observed = matches.copy()
+            if row[5] is not None:
+                observed.add(row[5])
+            db.executemany("INSERT OR IGNORE INTO integration_publication_seen VALUES (?,?)",
+                           ((task_id, comment) for comment in observed))
+            count, = db.execute("SELECT count(*) FROM integration_publication_seen WHERE task_id=?",
+                                (task_id,)).fetchone()
+            state = row[3]
+            if count > 1:
+                state = "AMBIGUOUS"
+            elif (direct or complete) and len(matches) == 1 and state in {"SENDING", "UNCONFIRMED"}:
+                db.execute("UPDATE integration_tasks SET comment_id=? WHERE id=?", (matches.pop(), task_id))
+                state = "SENT"
+            elif state == "SENDING" or (complete and not matches and state == "SENT"):
+                state = "UNCONFIRMED"
+            db.execute("UPDATE integration_tasks SET state=? WHERE id=?", (state, task_id))
+            return state
 
     def receive_mock(self, comment, *, integration_id):
         # The configured principal must come from authenticated transport metadata.
@@ -256,9 +267,14 @@ class IntegrationAdapter:
 def parse_receipt(body):
     """Accept narrowly defined progress only; never derive completion from prose."""
     kind, lines = _message_lines(body)
+    if any(re.match(r"^\s*(?:id|command_id)\s*:\s*CMD-ORCH-", line, re.I) for line in lines):
+        raise ValueError("reserved namespace requires verified rc1 observation")
     if kind not in {"RESULT", "REVIEW"}:
         return read_historical_receipt(body)
-    fields = _read_fields(lines)
+    if any(re.match(r"^\s*(?:part|parts|section|continuation)\s*:", line, re.IGNORECASE)
+           for line in lines):
+        raise ValueError("multipart receipt requires reconciliation")
+    fields = _read_fields(lines, multiline=True)
     if fields.get("status") not in PROGRESS:
         return read_historical_receipt(body)
     if fields.keys() == {"id", "status", "evidence", "blockers"}:

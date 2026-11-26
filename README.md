@@ -12,3 +12,7 @@ python3.12 -B -m unittest discover -s tests -v
 - [协议](docs/PROTOCOL.md)、[权限](docs/PERMISSIONS.md) 和 [安全](docs/SECURITY.md)
 - [预算](docs/BUDGET.md)、[测试](docs/TEST_SPEC.md) 和 [变更记录](docs/CHANGELOG.md)
 - [P4 认证、唤醒、跨 runner 状态及最小实测方案](docs/P4_PLAN.md)
+
+## v1.0 运行入口
+
+统一私有任务台账、版本化审核队列、终审导出和停机恢复见 [v1.0 安装与运行](docs/V1_RUNBOOK.md)。现有巡检和外部发布不由安装步骤启用。

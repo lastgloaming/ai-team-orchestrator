@@ -98,9 +98,24 @@ class IntegrationAdapterTests(unittest.TestCase):
         self.assertEqual(self.send(task, self.forbidden), "UNCONFIRMED")
         self.assertEqual(self.adapter.reconcile_mock(task, []), "UNCONFIRMED")
         self.assertEqual(self.adapter.reconcile_mock(task, [replace(posted[0], id=19)]), "UNCONFIRMED")
-        self.assertEqual(self.adapter.reconcile_mock(task, [posted[0], replace(posted[0], id=21)]), "UNCONFIRMED")
         self.assertEqual(self.adapter.reconcile_mock(task, [replace(posted[0], pr=4)]), "UNCONFIRMED")
-        self.assertEqual(self.adapter.reconcile_mock(task, posted), "SENT")
+        self.assertEqual(self.adapter.reconcile_mock(task, posted), "UNCONFIRMED")
+        self.assertEqual(self.restart().reconcile_mock(task, posted, verified_complete=True), "SENT")
+        self.assertEqual(self.restart().reconcile_mock(task, [replace(posted[0], id=21)]), "AMBIGUOUS")
+        self.assertEqual(self.restart().reconcile_mock(task, posted, verified_complete=True), "AMBIGUOUS")
+        self.assertEqual(self.send(task, self.forbidden), "AMBIGUOUS")
+
+    def test_direct_confirmation_cannot_override_conflicting_page(self):
+        task = self.enqueue("event", "report_status")
+
+        def publish(body):
+            first = self.comment(body)
+            self.assertEqual(self.restart().reconcile_mock(task, [first]), "UNCONFIRMED")
+            return replace(first, id=first.id + 1)
+
+        self.assertEqual(self.send(task, publish), "AMBIGUOUS")
+        self.assertEqual(self.restart().status(task), "AMBIGUOUS")
+        self.assertEqual(self.send(task, self.forbidden), "AMBIGUOUS")
 
     def test_receipts_cannot_schedule_and_shared_actor_cannot_confirm(self):
         task = self.enqueue("event", "report_status")
@@ -155,7 +170,9 @@ IntegrationAdapter(sys.argv[1]).dispatch_mock(sys.argv[2], lambda _: os._exit(23
         self.assertEqual(child.returncode, 23)
         self.adapter = self.restart()
         self.assertEqual(self.send(task, self.forbidden), "SENDING")
-        self.assertEqual(self.adapter.reconcile_mock(task, []), "SENDING")
+        self.assertEqual(self.adapter.reconcile_mock(task, []), "UNCONFIRMED")
+        self.adapter = self.restart()
+        self.assertEqual(self.send(task, self.forbidden), "UNCONFIRMED")
 
     def test_reserved_ids_required_and_competing_allocators_do_not_reuse(self):
         with self.assertRaises(PermissionError):
@@ -210,3 +227,10 @@ IntegrationAdapter(sys.argv[1]).dispatch_mock(sys.argv[2], lambda _: os._exit(23
         self.restart().provision_mock_ids([legacy])
         self.assertEqual(self.send(legacy, self.forbidden), "BLOCKED")
         self.assertEqual(self.enqueue("new-event", "report_status"), "CMD-20990101-702")
+
+    def test_indented_multiline_result_does_not_accept_multipart_markers(self):
+        task = self.enqueue("multiline-fixture", "report_status")
+        self.assertEqual(self.send(task, self.comment), "SENT")
+        first = f"AI-INTEGRATION-RESULT\nid: {task}\nstatus: DONE\nevidence: fixture"
+        self.assertEqual(self.receipt(first + "\n  part: 1 of 2\nblockers: none"), "REJECTED")
+        self.assertEqual(self.receipt(first + "\n  synthetic continuation\nblockers: none", 22), "DONE")
