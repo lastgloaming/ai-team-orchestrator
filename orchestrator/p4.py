@@ -97,10 +97,12 @@ def single_call(state, limits, transport):
         raise ValueError("P4 requires one call, with zero retries")
 
     def reserve(path):
+        advisor = Advisor(path, limits, transport)
         with transaction(path) as db:
             if db.execute("SELECT 1 FROM p4_call").fetchone():
+                advisor._require_currency(db)
                 return None
-        reservation = Advisor(path, limits, transport)._reserve()
+        reservation = advisor._reserve()
         with transaction(path) as db:
             db.execute("INSERT INTO p4_call VALUES (1, ?)", (reservation,))
         return reservation
@@ -159,6 +161,23 @@ def configured_probe():
                          int(os.environ["ORCHESTRATOR_P4_SHARED_ACTOR"]))
 
 
+CNY_TEST_BUDGET = 2_200_000_000
+
+
+def configured_model_limits():
+    currency = os.environ.get("ORCHESTRATOR_P4_BILLING_CURRENCY") or "USD"
+    rates = {"USD": (300, 1200, "NANODOLLARS"), "CNY": (2000, 8000, "NANOYUAN")}
+    if currency not in rates:
+        raise ValueError("billing currency must be USD or CNY")
+    input_rate, output_rate, denomination = rates[currency]
+    budget = int(os.environ[f"ORCHESTRATOR_P4_BUDGET_{denomination}"])
+    if currency == "CNY" and budget > CNY_TEST_BUDGET:
+        raise ValueError("CNY test budget exceeds 2.20 CNY")
+    input_bound = int(os.environ["ORCHESTRATOR_P4_INPUT_TOKEN_BOUND"])
+    return Limits("deepseek-flash", input_rate, output_rate, input_bound, 64,
+                  budget, budget, 1, 1, concurrent=1, retries=0, currency=currency)
+
+
 def run(state, args, parser):
 
     if args.operation == "enqueue-probe":
@@ -177,10 +196,7 @@ def run(state, args, parser):
     else:
         if os.environ.get("ORCHESTRATOR_LIVE_APPROVED") != "1" or not os.environ.get("DEEPSEEK_API_KEY"):
             parser.error("live model request is disabled or missing credentials")
-        budget = int(os.environ["ORCHESTRATOR_P4_BUDGET_NANODOLLARS"])
-        input_bound = int(os.environ["ORCHESTRATOR_P4_INPUT_TOKEN_BOUND"])
-        limits = Limits("deepseek-flash", 300, 1200, input_bound, 64, budget, budget, 1, 1, retries=0)
-        print(single_call(state, limits, live_transport))
+        print(single_call(state, configured_model_limits(), live_transport))
 
 
 if __name__ == "__main__":

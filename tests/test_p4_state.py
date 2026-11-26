@@ -179,3 +179,26 @@ class P4StateTests(unittest.TestCase):
         restarted = self.current()
         self.assertEqual(state.checkpoint, restarted.checkpoint)
         self.assertFalse(restarted.update(lambda path: enqueue(path, "TEST-1", self.payload)))
+
+    def test_cny_p4_timeout_persists_one_shot_and_rejects_wrong_billing_currency(self):
+        limits = Limits("deepseek-flash", 2000, 8000, 1_099_744, 64,
+                        2_200_000_000, 2_200_000_000, 1, 1, retries=0, currency="CNY")
+        calls = []
+
+        def mock(request, timeout):
+            calls.append(request)
+            raise TimeoutError()
+
+        with self.assertRaisesRegex(RuntimeError, "reservation retained"):
+            single_call(self.state, limits, mock)
+        self.assertEqual(single_call(self.current(), limits, mock), "already reserved; no request sent")
+        usd = Limits("deepseek-flash", 300, 1200, 1024, 64, 400_000, 400_000, 1, 1, retries=0)
+        with self.assertRaisesRegex(RuntimeError, "billing currency"):
+            single_call(self.current(), usd, mock)
+
+        def read(path):
+            with transaction(path) as db:
+                return db.execute("SELECT currency, amount, state FROM usage").fetchall()
+
+        self.assertEqual(self.current().update(read), [("CNY", 2_200_000_000, "uncertain")])
+        self.assertEqual(len(calls), 1)
