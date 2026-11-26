@@ -15,17 +15,27 @@ from unittest.mock import patch
 
 from orchestrator.auto_events import AUTHOR_ACCOUNT, REPOSITORY
 from orchestrator.auto_state import PairedState
-from orchestrator.deepseek import Limits
+from orchestrator.deepseek import Advisor, Limits
+from orchestrator.live_approval import Execution, request_digest
 from orchestrator.live_scheduling import (
-    COMMAND, REFS, Authorization, PrivateLedger, checked_remote, check_source, schedule_event,
+    COMMAND, REFS, Authorization, PrivateLedger, checked_remote, check_source, main, schedule_event,
 )
 
-APPROVAL = Authorization("a" * 32, 101, 50, 2)
 LIMITS = Limits("deepseek-flash", 2000, 8000, 10, 64, 2_200_000_000, 2_200_000_000,
                 1, 1, retries=0, currency="CNY")
 
 
-def event(approval=APPROVAL, body=COMMAND):
+CODE = "d" * 40
+BILLING = ("lastgloaming/fixture-billing", 90)
+
+
+def authorization(anchors, limits=LIMITS):
+    execution = Execution(CODE, *BILLING, anchors, limits,
+                          request_digest(Advisor(None, limits, None).request("ACCEPTED")))
+    return Authorization("a" * 32, 101, 50, 2, execution)
+
+
+def event(approval, body=COMMAND):
     return {
         "action": "created", "repository": {"id": approval.repository_id, "full_name": REPOSITORY},
         "issue": {"number": approval.pr, "state": "open", "pull_request": {}},
@@ -46,14 +56,16 @@ class LiveSchedulingTests(unittest.TestCase):
         self.remote = str(Path(temp.name) / "billing.git")
         subprocess.run(["git", "init", "--bare", "--quiet", self.remote], check=True)
         self.anchors = PrivateLedger(self.remote).bootstrap()
+        self.approval = authorization(self.anchors)
 
     def state(self, cls=PrivateLedger):
-        return cls(self.remote, self.anchors)
+        return cls(self.remote, self.anchors, ledger_repo=BILLING[0], ledger_id=BILLING[1])
 
-    def run_event(self, transport, *, state=None, authorization=APPROVAL, payload=None, actor=str(AUTHOR_ACCOUNT),
+    def run_event(self, transport, *, state=None, authorization=None, payload=None, actor=str(AUTHOR_ACCOUNT),
                   limits=LIMITS, scheduling=True, live=True, token="fixture"):
+        authorization = authorization or self.approval
         return schedule_event(state or self.state(), authorization, payload or event(authorization), actor,
-                              limits, transport, scheduling=lambda: scheduling, live=lambda: live, token=token)
+                              limits, transport, scheduling=lambda: scheduling, live=lambda: live, token=token, code_sha=CODE)
 
     def fail_if_called(self, *_):
         self.fail("model transport was invoked")
@@ -68,13 +80,13 @@ class LiveSchedulingTests(unittest.TestCase):
         for scheduling, live in ((False, False), (False, True), (True, False)):
             result = self.run_event(self.fail_if_called, scheduling=scheduling, live=live)
             self.assertEqual(result["scheduling"], "DISABLED")
-        incorrect_pr = event()
+        incorrect_pr = event(self.approval)
         incorrect_pr["issue"]["number"] = 3
         for result in (
             self.run_event(self.fail_if_called, actor="99"),
             self.run_event(self.fail_if_called, payload=incorrect_pr),
-            self.run_event(self.fail_if_called, payload=event(body="P4-SYNTHETIC-COMMAND")),
-            self.run_event(self.fail_if_called, payload=event(body="P5-SYNTHETIC-ADVICE")),
+            self.run_event(self.fail_if_called, payload=event(self.approval, body="P4-SYNTHETIC-COMMAND")),
+            self.run_event(self.fail_if_called, payload=event(self.approval, body="P5-SYNTHETIC-ADVICE")),
         ):
             self.assertEqual(result["scheduling"], "NOT_ELIGIBLE")
         with self.assertRaisesRegex(ValueError, "credential"):
@@ -84,7 +96,7 @@ class LiveSchedulingTests(unittest.TestCase):
     def test_success_requires_committed_authorization_and_cannot_replay_or_reconfigure(self):
         def transport(request, timeout):
             self.assertEqual(request["max_tokens"], 64)
-            self.assertEqual(self.rows("SELECT approval,event_id FROM live_authorization"), [(APPROVAL.approval, 101)])
+            self.assertEqual(self.rows("SELECT approval,event_id FROM live_authorization"), [(self.approval.approval, 101)])
             self.assertEqual(self.rows("SELECT amount,state,currency FROM usage"), [(532_000, "active", "CNY")])
             self.assertEqual(self.rows("SELECT status FROM auto_model_attempt"), [("RESERVED",)])
             return response()
@@ -93,17 +105,18 @@ class LiveSchedulingTests(unittest.TestCase):
         self.assertEqual((result["communication"], result["model_call"], result["scheduling"]),
                          ("ACCEPTED", "SUCCEEDED", "ADVISED"))
         self.assertEqual(self.run_event(self.fail_if_called)["model_call"], "RECORDED_SUCCEEDED")
-        new = replace(APPROVAL, approval="b" * 32, event_id=102, pr=3)
+        new = replace(self.approval, approval="b" * 32, event_id=102, pr=3)
         self.assertEqual(self.run_event(self.fail_if_called, authorization=new)["scheduling"], "BLOCKED")
         self.assertEqual(self.rows("SELECT count(*) FROM usage"), [(1,)])
 
     def test_budget_denial_is_persisted_without_usage_and_is_not_reevaluated(self):
         low = replace(LIMITS, daily_budget=531_999)
-        result = self.run_event(self.fail_if_called, limits=low)
+        signed_low = authorization(self.anchors, low)
+        result = self.run_event(self.fail_if_called, limits=low, authorization=signed_low)
         self.assertEqual((result["model_call"], result["scheduling"]), ("NOT_SENT", "BLOCKED"))
         self.assertEqual(self.rows("SELECT status,reason FROM auto_model_attempt"), [("BLOCKED", "budget_exhausted")])
         self.assertEqual(self.rows("SELECT count(*) FROM usage"), [(0,)])
-        self.assertEqual(self.run_event(self.fail_if_called)["scheduling"], "BLOCKED")
+        self.assertEqual(self.run_event(self.fail_if_called, authorization=signed_low, limits=low)["scheduling"], "BLOCKED")
 
     def test_output_is_not_actionable(self):
         result = self.run_event(lambda *_: response("execute_anything"))
@@ -115,10 +128,12 @@ class LiveSchedulingTests(unittest.TestCase):
         code = """
 import os,sys
 from orchestrator.live_scheduling import PrivateLedger
-from test_live_scheduling import APPROVAL,LIMITS,event
+from test_live_scheduling import BILLING,CODE,LIMITS,authorization,event
 from orchestrator.live_scheduling import schedule_event,AUTHOR_ACCOUNT
-schedule_event(PrivateLedger(sys.argv[1],tuple(sys.argv[2:])),APPROVAL,event(),str(AUTHOR_ACCOUNT),
-               LIMITS,lambda *_: os._exit(23),scheduling=lambda:True,live=lambda:True,token='fixture')
+state=PrivateLedger(sys.argv[1],tuple(sys.argv[2:]),ledger_repo=BILLING[0],ledger_id=BILLING[1])
+approved=authorization(state.anchors)
+schedule_event(state,approved,event(approved),str(AUTHOR_ACCOUNT),
+               LIMITS,lambda *_: os._exit(23),scheduling=lambda:True,live=lambda:True,token='fixture',code_sha=CODE)
 """
         child = subprocess.run([sys.executable, "-B", "-c", code, self.remote, *self.anchors],
                                env={**os.environ, "PYTHONPATH": str(Path(__file__).parent)}, timeout=20)
@@ -158,7 +173,7 @@ schedule_event(PrivateLedger(sys.argv[1],tuple(sys.argv[2:])),APPROVAL,event(),s
         with patch("orchestrator.live_scheduling.urllib.request.build_opener") as open_mock:
             open_mock.return_value.open.side_effect = [io.BytesIO(json.dumps(row).encode()) for row in (target, comment)]
             with self.assertRaisesRegex(ValueError, "no longer matches"):
-                check_source(APPROVAL, "fixture")
+                check_source(self.approval, "fixture")
 
     def test_concurrent_writers_never_consume_same_approval_twice(self):
         calls = []
@@ -190,3 +205,41 @@ schedule_event(PrivateLedger(sys.argv[1],tuple(sys.argv[2:])),APPROVAL,event(),s
         self.assertEqual(self.run_event(mock)["model_call"], "UNCONFIRMED")
         self.assertEqual(self.run_event(self.fail_if_called)["model_call"], "UNCONFIRMED")
         self.assertEqual(self.rows("SELECT amount,state FROM usage"), [(532_000, "uncertain")])
+
+    def test_modified_limits_main_request_and_ledger_are_refused_before_first_use(self):
+        for limits in (replace(LIMITS, input_ceiling=9), replace(LIMITS, daily_budget=1_000_000),
+                       replace(LIMITS, model="different"), replace(LIMITS, max_output=63)):
+            with self.subTest(limits=limits), self.assertRaisesRegex(ValueError, "signed execution"):
+                self.run_event(self.fail_if_called, limits=limits)
+        altered = replace(self.approval, execution=replace(self.approval.execution, request_sha256="0" * 64))
+        with self.assertRaisesRegex(ValueError, "signed execution"):
+            self.run_event(self.fail_if_called, authorization=altered)
+        with self.assertRaisesRegex(ValueError, "signed execution"):
+            schedule_event(self.state(), self.approval, event(self.approval), str(AUTHOR_ACCOUNT),
+                           LIMITS, self.fail_if_called, scheduling=lambda: True, live=lambda: True,
+                           token="fixture", code_sha="e" * 40)
+        wrong = PrivateLedger(self.remote, self.anchors, ledger_repo=BILLING[0], ledger_id=91)
+        with self.assertRaisesRegex(ValueError, "signed execution"):
+            self.run_event(self.fail_if_called, state=wrong)
+        other = self.remote + "-other"
+        subprocess.run(["git", "init", "--bare", "--quiet", other], check=True)
+        # A second valid empty ledger cannot inherit the original approval.
+        with patch.dict(os.environ, {"GIT_AUTHOR_DATE": "2025-01-01T00:00:00+00:00",
+                                     "GIT_COMMITTER_DATE": "2025-01-01T00:00:00+00:00"}):
+            wrong_anchors = PrivateLedger(other).bootstrap()
+        wrong = PrivateLedger(other, wrong_anchors, ledger_repo=BILLING[0], ledger_id=BILLING[1])
+        with self.assertRaisesRegex(ValueError, "signed execution"):
+            self.run_event(self.fail_if_called, state=wrong)
+        self.assertEqual(self.rows("SELECT count(*) FROM live_authorization"), [(0,)])
+
+    def test_bootstrap_and_paid_paths_are_blocked_even_with_switches_enabled(self):
+        base = {"GITHUB_REPOSITORY": REPOSITORY, "GITHUB_REF": "refs/heads/main",
+                "ORCHESTRATOR_P5_SCHEDULING_ENABLED": "1", "ORCHESTRATOR_P5_LIVE_APPROVED": "1",
+                "ORCHESTRATOR_P5_BOOTSTRAP_APPROVED": "1"}
+        for event_name in ("issue_comment", "workflow_dispatch"):
+            with patch.dict(os.environ, {**base, "GITHUB_EVENT_NAME": event_name}, clear=True), patch(
+                "orchestrator.live_scheduling.checked_remote",
+            ) as remote:
+                with self.assertRaisesRegex(ValueError, "BLOCKED"):
+                    main()
+                remote.assert_not_called()

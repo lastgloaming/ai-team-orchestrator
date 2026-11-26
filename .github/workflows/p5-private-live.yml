@@ -19,7 +19,9 @@ env:
   ORCHESTRATOR_P5_LIVE_APPROVED: ${{ vars.ORCHESTRATOR_P5_LIVE_APPROVED }}
 jobs:
   bootstrap-private:
+    # Hard hold pending independently verified private rollback protection.
     if: >-
+      false &&
       github.event_name == 'workflow_dispatch' &&
       github.repository == 'lastgloaming/ai-team-orchestrator' &&
       github.ref == 'refs/heads/main' &&
@@ -42,7 +44,9 @@ jobs:
           ORCHESTRATOR_P5_BOOTSTRAP_APPROVED: ${{ vars.ORCHESTRATOR_P5_BOOTSTRAP_APPROVED }}
           ORCHESTRATOR_P5_LEDGER_TOKEN: ${{ secrets.ORCHESTRATOR_P5_LEDGER_TOKEN }}
   private-advice:
+    # Hard hold pending independently verified private rollback protection.
     if: >-
+      false &&
       github.event_name == 'issue_comment' &&
       github.repository == 'lastgloaming/ai-team-orchestrator' &&
       github.ref == 'refs/heads/main' &&
@@ -65,13 +69,9 @@ jobs:
       - run: python -B -m orchestrator.live_scheduling
         env:
           ORCHESTRATOR_P5_LEDGER_TOKEN: ${{ secrets.ORCHESTRATOR_P5_LEDGER_TOKEN }}
+          ORCHESTRATOR_P5_SIGNED_APPROVAL: ${{ vars.ORCHESTRATOR_P5_SIGNED_APPROVAL }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
-          ORCHESTRATOR_P5_APPROVAL_ID: ${{ vars.ORCHESTRATOR_P5_APPROVAL_ID }}
-          ORCHESTRATOR_P5_APPROVED_COMMENT: ${{ vars.ORCHESTRATOR_P5_APPROVED_COMMENT }}
-          ORCHESTRATOR_P5_SOURCE_REPO_ID: ${{ vars.ORCHESTRATOR_P5_SOURCE_REPO_ID }}
           ORCHESTRATOR_P5_TEST_PR: ${{ vars.ORCHESTRATOR_P5_TEST_PR }}
-          ORCHESTRATOR_P5_BUDGET_NANOYUAN: ${{ vars.ORCHESTRATOR_P5_BUDGET_NANOYUAN }}
-          ORCHESTRATOR_P5_INPUT_BOUND: ${{ vars.ORCHESTRATOR_P5_INPUT_BOUND }}
           ORCHESTRATOR_MODEL_STOP: ${{ vars.ORCHESTRATOR_MODEL_STOP }}
           ORCHESTRATOR_STOP: ${{ vars.ORCHESTRATOR_STOP }}

@@ -14,7 +14,8 @@ from pathlib import Path
 from .auto_events import AUTHOR_ACCOUNT, REPOSITORY, positive_id
 from .auto_state import SCHEMA as COMMUNICATION_SCHEMA, PairedState
 from .core import transaction
-from .deepseek import Limits, NoRedirect, live_transport
+from .deepseek import Advisor, NoRedirect, live_transport
+from .live_approval import Execution, binding_bytes, decode_snapshot, execution_from_payload, request_digest
 from .mock_scheduling import Scheduler, model_transaction
 from .scheduling_ledger import ModelStatus, check_transition, inspect_snapshot
 from .state import CHECKPOINT, StateConflict
@@ -24,6 +25,11 @@ COMMAND = "P5-SYNTHETIC-LIVE-ADVICE"
 REFS = ("refs/heads/p5-live-charge-state", "refs/heads/p5-live-charge-checkpoints")
 LEDGER_NAME = re.compile(r"lastgloaming/[A-Za-z0-9][A-Za-z0-9_.-]{0,98}")
 AUTH_ID = re.compile(r"[0-9a-f]{32}")
+# Deployment is blocked until an independently durable private trust design is
+# reviewed. These are code-reviewed trust settings, never repository variables.
+PRIVATE_DURABILITY_APPROVED = False
+REVIEWED_APPROVAL_KEY_SHA256 = None
+
 AUTH_SCHEMA = """
 CREATE TABLE live_authorization (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -31,7 +37,8 @@ CREATE TABLE live_authorization (
     event_id INTEGER NOT NULL UNIQUE REFERENCES auto_inbox(id),
     repository_id INTEGER NOT NULL,
     pr INTEGER NOT NULL,
-    author INTEGER NOT NULL CHECK(author = 338499555)
+    author INTEGER NOT NULL CHECK(author = 338499555),
+    binding TEXT NOT NULL
 );
 """
 
@@ -42,20 +49,31 @@ class Authorization:
     event_id: int
     repository_id: int
     pr: int
+    execution: Execution
 
     def __post_init__(self):
         if (not AUTH_ID.fullmatch(self.approval) or not all(positive_id(value) for value in
                 (self.event_id, self.repository_id, self.pr)) or self.pr <= 1):
             raise ValueError("exact one-shot approval and isolated PR required")
+        execution = self.execution
+        if (not CHECKPOINT.fullmatch(execution.code_sha) or not LEDGER_NAME.fullmatch(execution.ledger_repo)
+                or execution.ledger_repo.lower() == REPOSITORY
+                or not positive_id(execution.ledger_id) or execution.ledger_id == self.repository_id
+                or len(execution.anchors) != 2 or execution.anchors[0] == execution.anchors[1]
+                or any(not CHECKPOINT.fullmatch(anchor) for anchor in execution.anchors)
+                or type(execution.request_version) is not int or execution.request_version != 1
+                or not re.fullmatch(r"[0-9a-f]{64}", execution.request_sha256)):
+            raise ValueError("invalid reviewed execution binding")
 
 
 class PrivateLedger(PairedState):
     refs = REFS
     schema = COMMUNICATION_SCHEMA + AUTH_SCHEMA
 
-    def __init__(self, remote, anchors=None, *, token=None):
+    def __init__(self, remote, anchors=None, *, token=None, ledger_repo=None, ledger_id=None):
         super().__init__(remote, ENVIRONMENT, anchors)
         self.git_token = token
+        self.ledger_identity = (ledger_repo, ledger_id)
 
     @staticmethod
     def inspect_snapshot(path):
@@ -63,7 +81,7 @@ class PrivateLedger(PairedState):
         inbox, eligible, attempts, _ = model
         with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as db:
             bindings = db.execute(
-                "SELECT singleton,approval,event_id,repository_id,pr,author FROM live_authorization"
+                "SELECT singleton,approval,event_id,repository_id,pr,author,binding FROM live_authorization"
             ).fetchall()
             if any(db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
                    for table in ("auto_binding", "auto_outbox")):
@@ -74,8 +92,12 @@ class PrivateLedger(PairedState):
             return model, None
         if len(bindings) != 1:
             raise StateConflict("invalid private one-shot binding")
-        singleton, approval, event_id, repo, pr, author = bindings[0]
-        Authorization(approval, event_id, repo, pr)
+        singleton, approval, event_id, repo, pr, author, encoded = bindings[0]
+        payload = json.loads(encoded)
+        bound = parse_approval(payload)
+        if (binding_bytes(bound).decode() != encoded
+                or (bound.approval, bound.event_id, bound.repository_id, bound.pr) != (approval, event_id, repo, pr)):
+            raise StateConflict("approval snapshot does not match private ledger columns")
         if (singleton != 1 or author != AUTHOR_ACCOUNT or inbox != {event_id: 1}
                 or eligible != {event_id} or set(attempts) != {event_id}):
             raise StateConflict("private billing reservation and approval do not match")
@@ -90,14 +112,15 @@ class PrivateLedger(PairedState):
 
 def authorize(path, approved):
     with transaction(path, schema="") as db:
-        row = db.execute("SELECT approval,event_id,repository_id,pr,author FROM live_authorization").fetchone()
-        values = (approved.approval, approved.event_id, approved.repository_id, approved.pr, AUTHOR_ACCOUNT)
+        row = db.execute("SELECT approval,event_id,repository_id,pr,author,binding FROM live_authorization").fetchone()
+        values = (approved.approval, approved.event_id, approved.repository_id, approved.pr,
+                  AUTHOR_ACCOUNT, binding_bytes(approved).decode())
         if row is not None:
             if row != values:
                 raise StateConflict("different approval cannot reuse this private ledger")
             return
         db.execute("INSERT INTO auto_inbox (id,consumed) VALUES (?,1)", (approved.event_id,))
-        db.execute("INSERT INTO live_authorization VALUES (1,?,?,?,?,?)", values)
+        db.execute("INSERT INTO live_authorization VALUES (1,?,?,?,?,?,?)", values)
     with model_transaction(path) as db:
         db.execute("INSERT INTO auto_model_eligibility VALUES (?)", (approved.event_id,))
 
@@ -117,15 +140,35 @@ def event_matches(event, actor, approved):
         return False
 
 
-def schedule_event(state, approved, event, actor, limits, transport, *, scheduling, live, token):
+def parse_approval(payload):
+    data = dict(payload)
+    data["execution"] = execution_from_payload(data["execution"])
+    return Authorization(**data)
+
+
+def verify_execution(approved, limits, code_sha, ledger_identity, anchors):
+    execution = approved.execution
+    if (code_sha != execution.code_sha or ledger_identity != (execution.ledger_repo, execution.ledger_id)
+            or anchors != execution.anchors or limits != execution.limits
+            or limits.model != "deepseek-flash" or limits.max_output != 64
+            or limits.daily_calls != 1 or limits.monthly_calls != 1
+            or request_digest(Advisor(None, limits, None).request("ACCEPTED")) != execution.request_sha256):
+        raise ValueError("runtime configuration differs from signed execution")
+
+
+def schedule_event(state, approved, event, actor, limits, transport, *, scheduling, live, token, code_sha):
     if not scheduling() or not live():
         return {"communication": "DISABLED", "model_call": "NOT_SENT", "scheduling": "DISABLED"}
     if not event_matches(event, actor, approved):
         return {"communication": "REJECTED", "model_call": "NOT_SENT", "scheduling": "NOT_ELIGIBLE"}
+    if not isinstance(state, PrivateLedger):
+        raise ValueError("private ledger required")
+    verify_execution(approved, limits, code_sha, state.ledger_identity, state.anchors)
+    expected_remote = f"https://github.com/{approved.execution.ledger_repo}.git"
+    if state.remote.startswith(("https://", "http://")) and state.remote != expected_remote:
+        raise ValueError("billing remote differs from signed execution")
     if not token:
         raise ValueError("configured model credential required")
-    if not isinstance(state, PrivateLedger) or limits.daily_calls != 1 or limits.monthly_calls != 1:
-        raise ValueError("private ledger and one-shot limits required")
     attempted = False
 
     def invoke(request, timeout):
@@ -199,6 +242,8 @@ def main():
     def live():
         return env.get("ORCHESTRATOR_P5_LIVE_APPROVED") == "1"
 
+    if not PRIVATE_DURABILITY_APPROVED or not REVIEWED_APPROVAL_KEY_SHA256:
+        raise ValueError("BLOCKED: private rollback protection and approval trust root are not verified")
     bootstrap = env.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
     if bootstrap:
         expected = env.get("ORCHESTRATOR_P5_BOOTSTRAP_MAIN", "")
@@ -210,31 +255,36 @@ def main():
     elif env.get("GITHUB_EVENT_NAME") != "issue_comment" or not scheduling() or not live():
         return
 
-    ledger_token = env.get("ORCHESTRATOR_P5_LEDGER_TOKEN")
     if bootstrap:
+        ledger_token = env.get("ORCHESTRATOR_P5_LEDGER_TOKEN")
         remote = checked_remote(env["ORCHESTRATOR_P5_LEDGER_REPO"], int(env["ORCHESTRATOR_P5_LEDGER_ID"]), ledger_token)
         PrivateLedger(remote, token=ledger_token).bootstrap()
         print("Private genesis pair verified. Read and pin both refs through the private repository.")
         return
 
-    approved = Authorization(env["ORCHESTRATOR_P5_APPROVAL_ID"], int(env["ORCHESTRATOR_P5_APPROVED_COMMENT"]),
-                             int(env["ORCHESTRATOR_P5_SOURCE_REPO_ID"]), int(env["ORCHESTRATOR_P5_TEST_PR"]))
+    approved = parse_approval(decode_snapshot(env["ORCHESTRATOR_P5_SIGNED_APPROVAL"],
+                                             REVIEWED_APPROVAL_KEY_SHA256))
+    execution = approved.execution
+    code_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    if env.get("GITHUB_SHA") != code_sha:
+        raise ValueError("checkout differs from Actions commit")
+    verify_execution(approved, execution.limits, code_sha, (execution.ledger_repo, execution.ledger_id),
+                     execution.anchors)
     event = json.loads(Path(env["GITHUB_EVENT_PATH"]).read_bytes())
     actor = env.get("GITHUB_ACTOR_ID")
     if not event_matches(event, actor, approved):
         raise ValueError("comment not approved")
+    ledger_token = env.get("ORCHESTRATOR_P5_LEDGER_TOKEN")
     model_token = env.get("DEEPSEEK_API_KEY")
     if not model_token:
         raise ValueError("model credential missing")
     check_source(approved, env.get("GITHUB_TOKEN"))
-    budget = int(env["ORCHESTRATOR_P5_BUDGET_NANOYUAN"])
-    limits = Limits("deepseek-flash", 2000, 8000, int(env["ORCHESTRATOR_P5_INPUT_BOUND"]),
-                    64, budget, budget, 1, 1, retries=0, currency="CNY")
-    anchors = (env["ORCHESTRATOR_P5_STATE_ANCHOR"], env["ORCHESTRATOR_P5_WITNESS_ANCHOR"])
-    remote = checked_remote(env["ORCHESTRATOR_P5_LEDGER_REPO"], int(env["ORCHESTRATOR_P5_LEDGER_ID"]), ledger_token)
+    remote = checked_remote(execution.ledger_repo, execution.ledger_id, ledger_token)
     transport = partial(live_transport, approval_env="ORCHESTRATOR_P5_LIVE_APPROVED")
-    result = schedule_event(PrivateLedger(remote, anchors, token=ledger_token), approved, event, actor,
-                            limits, transport, scheduling=scheduling, live=live, token=model_token)
+    state = PrivateLedger(remote, execution.anchors, token=ledger_token,
+                          ledger_repo=execution.ledger_repo, ledger_id=execution.ledger_id)
+    result = schedule_event(state, approved, event, actor, execution.limits, transport,
+                            scheduling=scheduling, live=live, token=model_token, code_sha=code_sha)
     print(json.dumps(result))
     if result["scheduling"] != "ADVISED":
         raise SystemExit("P5 scheduling did not complete")
@@ -244,4 +294,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
+        if not PRIVATE_DURABILITY_APPROVED:
+            raise SystemExit("BLOCKED: private rollback protection is unverified.") from None
         raise SystemExit("P5 stopped; inspect the private checkpoint before any further action.") from None

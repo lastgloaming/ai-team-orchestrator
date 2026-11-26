@@ -1,30 +1,35 @@
 # P5 私有单次调度验证手册
 
-本 PR 只授权开发和 Mock。部署、凭证配置、私有初始化、真实费用和触发分别由作者批准。现有 P4 单次用量、公开通信与 P5 Mock 台账完全独立。
+**部署状态：BLOCKED。** 此 PR 只做离线和 Mock。真实作业和 bootstrap 都被工作流硬阻断，运行时还要求经代码审核固定的可信签名公钥指纹和经独立验收的私有防回退能力。开环境变量不能解除此阻断。
 
-## 部署参数
+## 不可变审批
 
-| 配置 | 用途 |
+经批准的配置用规范 JSON 和分离的 Ed25519 签名传递。变量仅运输签名封套，不能修改受签配置。签名公钥指纹必须经独立评审固定在受信源码，不从同一个封套或可编辑的仓库变量建立信任。当前没有部署公钥。
+
+封套包含 Base64 的 `payload`、`signature`、`public_key`。payload 固定审批 ID、源仓库 ID、隔离 PR、精确评论 ID；`execution` 固定已审核代码 SHA、目标私有仓库全名和数字 ID、两个 genesis 锚点、完整 `Limits`、请求版本与实际 HTTP JSON 字节的 SHA-256。在读取模型凭证、查询目标台账或预留之前验签，并核对 GitHub 事件 SHA、实际 checkout、请求摘要和事件身份。目标仓库还要以 API 核对私有、非 fork 和数字 ID。持久化的规范绑定在原子提交中与事件、预算和一次性标记同写，完全相同的审批只能读取结果。签署一份新封套也不会给已有绑定的台账第二次用量权限。
+
+## 无新增费用可行性
+
+| 方案 | 判断 |
 | --- | --- |
-| 受保护环境 `p5-private-live` | 仅可信 main，可用的人工审批人和防自批规则必须先验证。源工作流自己的 GitHub token 只有 contents: read |
-| `ORCHESTRATOR_P5_LEDGER_REPO`、`ORCHESTRATOR_P5_LEDGER_ID` | 同一所有者下专用于真实计费的私有非 fork 仓库。API 核验可见性、数字 ID 和名字。保持私有并限制改可见性 |
-| `ORCHESTRATOR_P5_LEDGER_TOKEN` | 未来仅在环境内配置已有、短时、限制到该私有仓库的凭证。需要元数据读取和两条 Git 引用的写入。只注入 Git 网络命令，HTTP header 限定目标 URL，禁止重定向 |
-| `ORCHESTRATOR_P5_STATE_ANCHOR`、`ORCHESTRATOR_P5_WITNESS_ANCHOR` | 已验证的私有 genesis SHA，固定在受保护配置，不推进，不采用公开或当前 tip |
-| `ORCHESTRATOR_P5_BOOTSTRAP_APPROVED` | 默认关闭，仅用于另行批准的一次 bootstrap |
-| `ORCHESTRATOR_P5_SCHEDULING_ENABLED`、`ORCHESTRATOR_P5_LIVE_APPROVED` | 两个独立开关，默认均关闭，维护仓库级作业条件和运行时检查 |
-| `ORCHESTRATOR_P5_SOURCE_REPO_ID`、`ORCHESTRATOR_P5_TEST_PR` | 公开源仓库数字 ID 和独立隔离 PR。原生事件及 REST 再验证均用同一绑定。固定作者数字 ID 338499555 |
-| `ORCHESTRATOR_P5_APPROVAL_ID`、`ORCHESTRATOR_P5_APPROVED_COMMENT` | 环境级的非秘密 32 位小写十六进制审批 ID 和作者该条固定合成命令评论的数字 ID。在受保护环境放行作业前核对 |
-| `ORCHESTRATOR_P5_BUDGET_NANOYUAN`、`ORCHESTRATOR_P5_INPUT_BOUND` | 另批的整数预算和独立核实的输入上界。峰值 2,000/8,000 纳人民币每 token，上限 2.20 元、输出 64、并发 1、零重试 |
-| `DEEPSEEK_API_KEY` | 仅未来配置在私有验证环境中。bootstrap 阶段不注入 |
-| `ORCHESTRATOR_MODEL_STOP`／`ORCHESTRATOR_STOP` | 设为 1 阻止新模型请求。对已开始的作业，应同时取消作业并核对状态 |
+| 两条私有 Git 引用、原子推送、固定 genesis | 只能防并发错写及部分更新。GitHub Free 私有仓库缺少所需分支规则；有能力回退两条引用的身份可重放旧有效快照。部署拒绝 |
+| 每次人工提供最新 SHA 或保存 Actions 制品 | 前者依赖人工维护最新版本，后者可过期或删除；均未提供独立、可靠的跨运行一次性保护。部署拒绝 |
+| 专用公开受保护 witness，只记录无敏感内容的不可重放承诺；账单留私有 | 概念上可以先消耗独立 witness，再提交私有预留，再发请求。两个仓库无法原子提交，任何中断必须宁愿烧掉授权而不重发。仍需单独批准公开元数据、两边凭证以及可信规则，验证两个仓库故障顺序和 witness 不能回退。当前未实施 |
+| 已有私有追加存储或可证明的独立保护 | 未发现可用的已授权资源。新增服务、付费升级或扩大权限均不在授权内 |
 
-## 后续实测顺序
+只有系统真正具备独立持久的一次性凭据、且私有台账不会回退造成漏记和二次消费时才重新评估。回放保证以可信签名根及保护的最新状态为前提，不能覆盖可绕过全部控制的 GitHub 管理员。 [GitHub 免费版规则适用范围](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)
 
-1. 先验证专用私有仓库还未初始化，且两条目标引用均配置禁止强推、禁止删除、写入者无绕过。一个 GitHub 仓库级令牌并不天然绑定分支，必须由保护规则隔离。若仓库权限不满足，停用。双引用同属同一信任域，成对绕过回退不可仅靠 genesis 检测。
-2. 经作者另批后，从本工作流的受信 main 手动触发 bootstrap，传入已核对主分支完整 SHA。诚实核验两个调度开关都关闭、私有锚点尚未填写。Git 只会尝试一次创建 `p5-live-charge-state` 和 `p5-live-charge-checkpoints`。通过已授权的私有读路径独立核对两条 genesis、环境名 `p5-private-live`、空台账和 sequence 0 后固定锚点，再关闭 bootstrap 开关。任何不确认结果都不得补推或重建。
-3. 独立核验 CNY 实际计费、固定请求的全部可计费输入边界与确切价格。即使本地预留不超过 2.20 元，也需要供应商证据及独立费用授权。确保没有遗留审批和真实 Integration 订阅，再按审批启用原生事件入口。
-4. 作者在指定隔离 PR 发一条精确的 `P5-SYNTHETIC-LIVE-ADVICE`。工作流等待环境审批。核对本次 run 的确切评论 ID，在环境里填入本次审批绑定，凭证存在且参数正确后，人工批准这个 run。首次云测先验证变量注入和停开关时的无副作用。如果环境等待期间无法可靠绑定参数或保护规则不可用，保持关闭。不要改为接受任意历史评论或任意重跑。
-5. 作业以 REST 只读重查 PR 和原评论；先原子持久化授权、事件资格、一次性标记与预算，再在事务外发一次请求。单个私有台账只接受一个审批，改配置、重放或重启不会打开第二次机会。预算拒绝也按事件持久化。请求或账本结果不明确时保留标记和预留，禁止重试、清空历史或另建台账绕过。
-6. 工作流 JSON 回执仅输出合成事件 ID、非秘密审批 ID、通信接收状态、模型状态和调度状态。其通信状态是接收核验，不代表 GitHub 发评论或 Bot 回复。不会公开用量、建议正文或凭证，不具备执行外部命令的能力。只有三个固定建议枚举可在私有台账中记录。验证人员通过私有路径核对账单与快照后关闭两个门禁。
+## 单账号与无凭证云端 Mock 设计
 
-离线验证命令为 `python3.12 -B -m unittest discover -s tests -v`。测试使用临时本地 Git 仓库、进程故障注入和 Mock HTTP。
+单账号下，若启用 prevent self-review，同一触发者不能充当所需审批人；现有账号无法满足第二人路径。允许自批只记录一次本人确认，不能提供独立复核，也不解决私有台账回退。不关闭防自批，不以 Environment 或变量注入时序代替签名绑定。独立于 GitHub 登录的签名密钥是设计上的作者意图证明，仍不是第二名审批人。 [GitHub 环境保护](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)
+
+现有 GitHub-hosted Mock CI 可运行验签和本地裸仓库测试，不配置 Secrets。额外的 Actions 可行性试验尚未执行。后续由作者另批一个只读、独立的临时合成 Workflow，按以下步骤验证再讨论部署：
+
+1. 只允许隔离测试 PR 的指定作者及固定 Mock 标记。捕获 `github.sha`、触发评论的精确 ID、仓库数字 ID 和 run ID。使用本地临时生成的测试签名密钥和预先构造的 fixture 封套；两个阶段通过同一运行的制品传递签名原件及摘要。没有真实签名根、模型密钥或私有台账凭证。
+2. 用默认只读工作流 token（`contents: read`，无需配置 Secrets）只读 GET 公开 PR 和评论。验证响应确实可用且匹配夹具中的 source、author、PR 和 comment。若 403，记为环境限制，另评估公开匿名只读，禁止增加权限或发送评论。本地 HTTP Mock 当前不能证明 GitHub 自动令牌的实际读取能力。
+3. 审批模拟仅传入签名后的固定运行快照，不在等待期间写可变变量来变更授权。让同一测试运行替换评论、结算参数、代码 SHA、台账和锚点，核对验签或执行绑定阻止 Mock 传输。复用临时本地裸 Git refs 模拟跨进程恢复。每次仅让 Mock 记录是否会请求。可另行以只读环境试验记录同账号审批 UI 的实际表现；防自批无法通过时继续 HOLD。
+4. 记录两个作业 ID、输入快照哈希、公开 GET 状态及 Mock 执行计数。全程不创建真正台账引用或对外发送消息。
+
+## 部署前置条件
+
+保留 `p5-private-live` 的两个开关、单独的 bootstrap 隔离与人工批准。未来必须先解决私有保护，审核可信公钥并通过上述云端 Mock，再确认 CNY 实际可计费输入上界、固定费率和供应商硬上限的证据。2.20 元是开发阶段本地预算上限。仅在作者额外批准后才考虑单次调用。模型异常、提交确认不明或进程退出都保留一次性标记，禁止自动重试。公开日志只应保留合成事件编号及状态，不保留实际用量、模型原文、私有内容或凭证。
